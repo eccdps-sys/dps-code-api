@@ -4,6 +4,25 @@ import string
 
 app = Flask(__name__)
 
+# =====================
+# SECURITY
+# =====================
+
+API_KEY = os.environ.get("API_KEY")
+
+
+def verify_api_key():
+    auth = request.headers.get("Authorization")
+
+    if auth != API_KEY:
+        return False
+
+    return True
+
+# =====================
+# GENERATORS
+# =====================
+
 
 def numbers(amount):
     return ''.join(random.choice(string.digits) for _ in range(amount))
