@@ -66,6 +66,3 @@ def investigation():
     return jsonify({
         "code": code
     })
-
-
-app.run(host="0.0.0.0", port=5000)
