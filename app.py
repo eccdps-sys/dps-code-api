@@ -1,9 +1,10 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import random
 import string
 import os
 
 app = Flask(__name__)
+
 
 # =====================
 # SECURITY
@@ -20,10 +21,10 @@ def verify_api_key():
 
     return True
 
+
 # =====================
 # GENERATORS
 # =====================
-
 
 def numbers(amount):
     return ''.join(random.choice(string.digits) for _ in range(amount))
@@ -33,14 +34,25 @@ def letters(amount):
     return ''.join(random.choice(string.ascii_uppercase) for _ in range(amount))
 
 
+# =====================
+# HOME
+# =====================
+
 @app.route("/")
 def home():
     return "DPS API Online"
 
 
-# Agreement Code
+# =====================
+# AGREEMENT CODE
+# =====================
+
 @app.route("/generate/agreement")
 def agreement():
+
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
     code = f"AGM-{numbers(4)}"
 
     return jsonify({
@@ -48,9 +60,16 @@ def agreement():
     })
 
 
-# Agent ID
+# =====================
+# AGENT ID
+# =====================
+
 @app.route("/generate/agent")
 def agent():
+
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
     code = f"DPS-AG-{numbers(5)}"
 
     return jsonify({
@@ -58,9 +77,16 @@ def agent():
     })
 
 
-# Security Join Code
+# =====================
+# JOIN CODE
+# =====================
+
 @app.route("/generate/join")
 def join():
+
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
     code = f"SC-{numbers(3)}{letters(1)}{numbers(1)}"
 
     return jsonify({
@@ -68,9 +94,16 @@ def join():
     })
 
 
-# Case Number
+# =====================
+# CASE NUMBER
+# =====================
+
 @app.route("/generate/case")
 def case():
+
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
     code = f"DPS-CASE-{numbers(5)}"
 
     return jsonify({
@@ -78,9 +111,16 @@ def case():
     })
 
 
-# Investigation Number
+# =====================
+# INVESTIGATION ID
+# =====================
+
 @app.route("/generate/investigation")
 def investigation():
+
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
     code = f"INV-{numbers(5)}"
 
     return jsonify({
