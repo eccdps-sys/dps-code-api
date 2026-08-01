@@ -53,7 +53,7 @@ def agreement():
     if not verify_api_key():
         return jsonify({"error": "Unauthorized"}), 401
 
-    code = f"AGM-{numbers(4)}"
+    code = f"AGM-{numbers(5)}"
 
     return jsonify({
         "code": code
