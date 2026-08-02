@@ -126,3 +126,20 @@ def investigation():
     return jsonify({
         "code": code
     })
+
+
+# =====================
+# CLEARANCE ID
+# =====================
+
+@app.route("/generate/clearance")
+def clearance():
+
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    code = f"CL-{numbers(3)}"
+
+    return jsonify({
+        "code": code
+    })
