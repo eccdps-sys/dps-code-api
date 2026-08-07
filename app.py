@@ -2,12 +2,9 @@ from flask import Flask, jsonify, request
 import random
 import string
 import os
-import json
-import tempfile
-import time
-import errno
 from datetime import datetime, timezone
-from contextlib import contextmanager
+from postgrest.exceptions import APIError
+from supabase import create_client, Client
 
 app = Flask(__name__)
 
@@ -37,94 +34,36 @@ def letters(amount):
     return ''.join(random.choice(string.ascii_uppercase) for _ in range(amount))
 
 
-# =====================
-# REPORT STORAGE CONFIG
-# =====================
-DATA_DIR = os.environ.get("DPS_DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
-REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")
-LOCK_FILE = REPORTS_FILE + ".lock"
+# =====================================================================
+# SUPABASE CLIENT
+# =====================================================================
+# Replaces: reports.json, DATA_DIR, LOCK_FILE, file locking, _load_reports(),
+# _save_reports(). All persistence now goes through Supabase Postgres.
+#
+# SUPABASE_URL and SUPABASE_KEY are required env vars. SUPABASE_KEY should
+# be the *service_role* key (Project Settings -> API -> service_role),
+# never the anon/public key, since this server writes on behalf of every
+# BotGhost user and must bypass Row Level Security.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-os.makedirs(DATA_DIR, exist_ok=True)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "SUPABASE_URL and SUPABASE_KEY environment variables are required."
+    )
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _load_reports():
-    """Load the reports JSON file, creating it if it doesn't exist."""
-    if not os.path.exists(REPORTS_FILE):
-        return {}
-    try:
-        with open(REPORTS_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                return {}
-            return json.loads(content)
-    except json.JSONDecodeError:
-        # Corrupt file - don't silently wipe data, surface it instead.
-        raise RuntimeError("reports.json is corrupted and could not be parsed")
-
-
-def _save_reports(reports):
-    """
-    Atomically write the reports dict back to disk.
-    Writes to a temp file then renames, so a crash mid-write can't corrupt
-    the store.
-    """
-    dir_name = os.path.dirname(REPORTS_FILE)
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".reports_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(reports, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, REPORTS_FILE)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
-
-
-class LockTimeout(Exception):
-    pass
-
-
-@contextmanager
-def with_reports_lock(timeout=10, poll_interval=0.05):
-    """
-    A minimal cross-request file lock using atomic exclusive file creation
-    (O_CREAT | O_EXCL). No third-party dependency required.
-
-    This guards against two simultaneous requests (e.g. two BotGhost
-    commands firing at once) reading, modifying, and writing reports.json
-    in a way that clobbers each other's changes.
-    """
-    deadline = time.time() + timeout
-    fd = None
-    while True:
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
-            if time.time() >= deadline:
-                raise LockTimeout("Timed out waiting for reports.json lock")
-            time.sleep(poll_interval)
-    try:
-        yield
-    finally:
-        os.close(fd)
-        try:
-            os.remove(LOCK_FILE)
-        except OSError:
-            pass
-
+REPORTS_TABLE = "reports"
+NOTES_TABLE = "notes"
+EVIDENCE_TABLE = "evidence"
+TIMELINE_TABLE = "timeline"
 
 REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "subject", "reason"]
 
 # Fields that BotGhost/clients are allowed to directly overwrite via PATCH.
-# notes/evidence/timeline are intentionally excluded - those are append-only
-# via their dedicated endpoints, so a PATCH can't accidentally wipe history.
+# notes/evidence/timeline stay append-only via their dedicated endpoints,
+# so a PATCH can't accidentally wipe history.
 PATCHABLE_FIELDS = {
     "reporter",
     "subject",
@@ -134,31 +73,143 @@ PATCHABLE_FIELDS = {
 }
 
 
-def new_report_shell(data):
-    """Builds the stored record for a new report from the incoming payload."""
-    return {
-        "report_id": data["report_id"],
-        "reporter": data["reporter"],
-        "subject": data["subject"],
-        "reason": data["reason"],
-        "status": data.get("status", "Open"),
-        "assigned_agent": data.get("assigned_agent", "Unassigned"),
-        "notes": [],
-        "evidence": [],
-        "timeline": [
-            {
-                "event": "Report created",
-                "by": data.get("reporter", "Unknown"),
-                "timestamp": _now_iso(),
-            }
-        ],
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
-    }
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def error_response(message, status_code):
     return jsonify({"success": False, "error": message}), status_code
+
+
+class ReportNotFound(Exception):
+    pass
+
+
+# =====================================================================
+# DATA ACCESS HELPERS
+# All Supabase calls are centralized here so the route handlers below
+# stay identical in shape to the original JSON-file version.
+# =====================================================================
+
+def db_get_report_row(report_id):
+    """Fetch the raw reports row, or None if it doesn't exist."""
+    resp = (
+        supabase.table(REPORTS_TABLE)
+        .select("*")
+        .eq("report_id", report_id)
+        .limit(1)
+        .execute()
+    )
+    rows = resp.data or []
+    return rows[0] if rows else None
+
+
+def db_get_notes(report_id):
+    resp = (
+        supabase.table(NOTES_TABLE)
+        .select("*")
+        .eq("report_id", report_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return resp.data or []
+
+
+def db_get_evidence(report_id):
+    resp = (
+        supabase.table(EVIDENCE_TABLE)
+        .select("*")
+        .eq("report_id", report_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return resp.data or []
+
+
+def db_get_timeline(report_id):
+    resp = (
+        supabase.table(TIMELINE_TABLE)
+        .select("*")
+        .eq("report_id", report_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return resp.data or []
+
+
+def serialize_note(row):
+    return {
+        "note": row.get("note"),
+        "author": row.get("author"),
+        "timestamp": row.get("created_at"),
+    }
+
+
+def serialize_evidence(row):
+    return {
+        "description": row.get("description"),
+        "url": row.get("url"),
+        "submitted_by": row.get("submitted_by"),
+        "timestamp": row.get("created_at"),
+    }
+
+
+def serialize_timeline(row):
+    return {
+        "event": row.get("event"),
+        "by": row.get("by"),
+        "timestamp": row.get("created_at"),
+    }
+
+
+def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_rows=None):
+    """
+    Assembles the full report object in exactly the shape BotGhost/the old
+    reports.json version returned: base fields plus notes/evidence/timeline
+    arrays.
+    """
+    if notes_rows is None:
+        notes_rows = db_get_notes(report_row["report_id"])
+    if evidence_rows is None:
+        evidence_rows = db_get_evidence(report_row["report_id"])
+    if timeline_rows is None:
+        timeline_rows = db_get_timeline(report_row["report_id"])
+
+    return {
+        "report_id": report_row["report_id"],
+        "reporter": report_row.get("reporter"),
+        "subject": report_row.get("subject"),
+        "reason": report_row.get("reason"),
+        "status": report_row.get("status"),
+        "assigned_agent": report_row.get("assigned_agent"),
+        "notes": [serialize_note(r) for r in notes_rows],
+        "evidence": [serialize_evidence(r) for r in evidence_rows],
+        "timeline": [serialize_timeline(r) for r in timeline_rows],
+        "created_at": report_row.get("created_at"),
+        "updated_at": report_row.get("updated_at"),
+    }
+
+
+def fetch_full_report_or_raise(report_id):
+    row = db_get_report_row(report_id)
+    if row is None:
+        raise ReportNotFound(report_id)
+    return build_report_json(row)
+
+
+def _summarize_notes_column(notes_rows):
+    """Builds the flat, human-readable reports.notes TEXT column."""
+    return " | ".join(
+        f"[{r.get('author', 'Unknown')}] {r.get('note', '')}" for r in notes_rows
+    )
+
+
+def _summarize_evidence_column(evidence_rows):
+    """Builds the flat, human-readable reports.evidence TEXT column."""
+    return " | ".join(
+        f"[{r.get('submitted_by', 'Unknown')}] {r.get('description', '')}"
+        for r in evidence_rows
+    )
 
 
 # =====================
@@ -253,23 +304,44 @@ def create_report():
         return error_response(f"Missing required field(s): {', '.join(missing)}", 400)
 
     report_id = str(payload["report_id"]).strip()
+    status = payload.get("status", "Open")
+    assigned_agent = payload.get("assigned_agent", "Unassigned")
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
+        existing = db_get_report_row(report_id)
+        if existing is not None:
+            return error_response(f"Report '{report_id}' already exists", 409)
 
-            if report_id in reports:
-                return error_response(f"Report '{report_id}' already exists", 409)
+        now = _now_iso()
+        insert_row = {
+            "report_id": report_id,
+            "reporter": payload["reporter"],
+            "subject": payload["subject"],
+            "reason": payload["reason"],
+            "notes": "",
+            "evidence": "",
+            "status": status,
+            "assigned_agent": assigned_agent,
+            "created_at": now,
+            "updated_at": now,
+        }
+        supabase.table(REPORTS_TABLE).insert(insert_row).execute()
 
-            record = new_report_shell({**payload, "report_id": report_id})
-            reports[report_id] = record
-            _save_reports(reports)
-    except LockTimeout:
-        return error_response("Server busy, please retry", 503)
-    except RuntimeError as e:
-        return error_response(str(e), 500)
+        # Seed timeline with a "Report created" entry, matching prior behavior.
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": "Report created",
+            "by": payload.get("reporter", "Unknown"),
+            "created_at": now,
+        }).execute()
 
-    return jsonify({"success": True, "report": record}), 201
+        report = fetch_full_report_or_raise(report_id)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "report": report}), 201
 
 
 @app.route("/reports/<report_id>", methods=["GET"])
@@ -278,14 +350,14 @@ def get_report(report_id):
         return error_response("Unauthorized", 401)
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
-    except RuntimeError as e:
-        return error_response(str(e), 500)
-
-    report = reports.get(report_id)
-    if report is None:
-        return error_response(f"Report '{report_id}' not found", 404)
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+        report = build_report_json(row)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "report": report}), 200
 
@@ -299,18 +371,21 @@ def list_reports():
     if not verify_api_key():
         return error_response("Unauthorized", 401)
 
-    try:
-        with with_reports_lock():
-            reports = _load_reports()
-    except RuntimeError as e:
-        return error_response(str(e), 500)
-
     status_filter = request.args.get("status")
-    values = list(reports.values())
-    if status_filter:
-        values = [r for r in values if r.get("status", "").lower() == status_filter.lower()]
 
-    return jsonify({"success": True, "count": len(values), "reports": values}), 200
+    try:
+        query = supabase.table(REPORTS_TABLE).select("*").order("created_at", desc=True)
+        if status_filter:
+            query = query.ilike("status", status_filter)
+        resp = query.execute()
+        rows = resp.data or []
+        reports = [build_report_json(row) for row in rows]
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "count": len(reports), "reports": reports}), 200
 
 
 @app.route("/reports/<report_id>/update", methods=["PATCH"])
@@ -322,7 +397,6 @@ def update_report(report_id):
     if payload is None:
         return error_response("Request body must be valid JSON", 400)
 
-    # Reject attempts to overwrite append-only or protected fields directly.
     disallowed = [k for k in payload.keys() if k not in PATCHABLE_FIELDS]
     if disallowed:
         return error_response(
@@ -335,31 +409,37 @@ def update_report(report_id):
         return error_response("No updatable fields provided", 400)
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
-            report = reports.get(report_id)
-            if report is None:
-                return error_response(f"Report '{report_id}' not found", 404)
+        existing = db_get_report_row(report_id)
+        if existing is None:
+            return error_response(f"Report '{report_id}' not found", 404)
 
-            changed_fields = []
-            for field, value in payload.items():
-                if report.get(field) != value:
-                    report[field] = value
-                    changed_fields.append(field)
+        changed_fields = [
+            field for field, value in payload.items() if existing.get(field) != value
+        ]
 
-            if changed_fields:
-                report["updated_at"] = _now_iso()
-                report["timeline"].append({
-                    "event": f"Updated field(s): {', '.join(changed_fields)}",
-                    "by": payload.get("assigned_agent") or "System",
-                    "timestamp": _now_iso(),
-                })
-                reports[report_id] = report
-                _save_reports(reports)
-    except LockTimeout:
-        return error_response("Server busy, please retry", 503)
-    except RuntimeError as e:
-        return error_response(str(e), 500)
+        if changed_fields:
+            now = _now_iso()
+            update_data = {field: payload[field] for field in changed_fields}
+            update_data["updated_at"] = now
+
+            supabase.table(REPORTS_TABLE).update(update_data).eq(
+                "report_id", report_id
+            ).execute()
+
+            supabase.table(TIMELINE_TABLE).insert({
+                "report_id": report_id,
+                "event": f"Updated field(s): {', '.join(changed_fields)}",
+                "by": payload.get("assigned_agent") or "System",
+                "created_at": now,
+            }).execute()
+
+        report = fetch_full_report_or_raise(report_id)
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "report": report}), 200
 
@@ -380,30 +460,41 @@ def add_note(report_id):
     author = str(payload.get("author", "Unknown")).strip() or "Unknown"
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
-            report = reports.get(report_id)
-            if report is None:
-                return error_response(f"Report '{report_id}' not found", 404)
+        existing = db_get_report_row(report_id)
+        if existing is None:
+            return error_response(f"Report '{report_id}' not found", 404)
 
-            entry = {
-                "note": note_text,
-                "author": author,
-                "timestamp": _now_iso(),
-            }
-            report["notes"].append(entry)
-            report["updated_at"] = _now_iso()
-            report["timeline"].append({
-                "event": f"Note added by {author}",
-                "by": author,
-                "timestamp": _now_iso(),
-            })
-            reports[report_id] = report
-            _save_reports(reports)
-    except LockTimeout:
-        return error_response("Server busy, please retry", 503)
-    except RuntimeError as e:
-        return error_response(str(e), 500)
+        now = _now_iso()
+
+        supabase.table(NOTES_TABLE).insert({
+            "report_id": report_id,
+            "note": note_text,
+            "author": author,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": f"Note added by {author}",
+            "by": author,
+            "created_at": now,
+        }).execute()
+
+        notes_rows = db_get_notes(report_id)
+
+        supabase.table(REPORTS_TABLE).update({
+            "notes": _summarize_notes_column(notes_rows),
+            "updated_at": now,
+        }).eq("report_id", report_id).execute()
+
+        entry = {"note": note_text, "author": author, "timestamp": now}
+        report = fetch_full_report_or_raise(report_id)
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "note": entry, "report": report}), 201
 
@@ -425,31 +516,47 @@ def add_evidence(report_id):
     url = payload.get("url", "")
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
-            report = reports.get(report_id)
-            if report is None:
-                return error_response(f"Report '{report_id}' not found", 404)
+        existing = db_get_report_row(report_id)
+        if existing is None:
+            return error_response(f"Report '{report_id}' not found", 404)
 
-            entry = {
-                "description": description,
-                "url": url,
-                "submitted_by": submitted_by,
-                "timestamp": _now_iso(),
-            }
-            report["evidence"].append(entry)
-            report["updated_at"] = _now_iso()
-            report["timeline"].append({
-                "event": f"Evidence added by {submitted_by}",
-                "by": submitted_by,
-                "timestamp": _now_iso(),
-            })
-            reports[report_id] = report
-            _save_reports(reports)
-    except LockTimeout:
-        return error_response("Server busy, please retry", 503)
-    except RuntimeError as e:
-        return error_response(str(e), 500)
+        now = _now_iso()
+
+        supabase.table(EVIDENCE_TABLE).insert({
+            "report_id": report_id,
+            "description": description,
+            "url": url,
+            "submitted_by": submitted_by,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": f"Evidence added by {submitted_by}",
+            "by": submitted_by,
+            "created_at": now,
+        }).execute()
+
+        evidence_rows = db_get_evidence(report_id)
+
+        supabase.table(REPORTS_TABLE).update({
+            "evidence": _summarize_evidence_column(evidence_rows),
+            "updated_at": now,
+        }).eq("report_id", report_id).execute()
+
+        entry = {
+            "description": description,
+            "url": url,
+            "submitted_by": submitted_by,
+            "timestamp": now,
+        }
+        report = fetch_full_report_or_raise(report_id)
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "evidence": entry, "report": report}), 201
 
@@ -470,25 +577,31 @@ def add_timeline_event(report_id):
     by = str(payload.get("by", "System")).strip() or "System"
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
-            report = reports.get(report_id)
-            if report is None:
-                return error_response(f"Report '{report_id}' not found", 404)
+        existing = db_get_report_row(report_id)
+        if existing is None:
+            return error_response(f"Report '{report_id}' not found", 404)
 
-            entry = {
-                "event": event_text,
-                "by": by,
-                "timestamp": _now_iso(),
-            }
-            report["timeline"].append(entry)
-            report["updated_at"] = _now_iso()
-            reports[report_id] = report
-            _save_reports(reports)
-    except LockTimeout:
-        return error_response("Server busy, please retry", 503)
-    except RuntimeError as e:
-        return error_response(str(e), 500)
+        now = _now_iso()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": event_text,
+            "by": by,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(REPORTS_TABLE).update({
+            "updated_at": now,
+        }).eq("report_id", report_id).execute()
+
+        entry = {"event": event_text, "by": by, "timestamp": now}
+        report = fetch_full_report_or_raise(report_id)
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "event": entry, "report": report}), 201
 
@@ -496,26 +609,24 @@ def add_timeline_event(report_id):
 @app.route("/reports/<report_id>", methods=["DELETE"])
 def delete_report(report_id):
     """
-    Optional: hard-delete a report. Not required by the spec, but included
-    since case management systems usually need a way to remove bad/test
-    entries. Gate this hard behind your API key.
+    Hard-delete a report. Child rows in notes/evidence/timeline are removed
+    automatically via ON DELETE CASCADE in the schema.
     """
     if not verify_api_key():
         return error_response("Unauthorized", 401)
 
     try:
-        with with_reports_lock():
-            reports = _load_reports()
-            if report_id not in reports:
-                return error_response(f"Report '{report_id}' not found", 404)
-            removed = reports.pop(report_id)
-            _save_reports(reports)
-    except LockTimeout:
-        return error_response("Server busy, please retry", 503)
-    except RuntimeError as e:
-        return error_response(str(e), 500)
+        existing = db_get_report_row(report_id)
+        if existing is None:
+            return error_response(f"Report '{report_id}' not found", 404)
 
-    return jsonify({"success": True, "deleted": removed["report_id"]}), 200
+        supabase.table(REPORTS_TABLE).delete().eq("report_id", report_id).execute()
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "deleted": report_id}), 200
 
 
 # =====================
