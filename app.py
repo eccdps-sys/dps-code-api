@@ -59,14 +59,14 @@ NOTES_TABLE = "notes"
 EVIDENCE_TABLE = "evidence"
 TIMELINE_TABLE = "timeline"
 
-REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "subject", "reason"]
+REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reason"]
 
 # Fields that BotGhost/clients are allowed to directly overwrite via PATCH.
 # notes/evidence/timeline stay append-only via their dedicated endpoints,
 # so a PATCH can't accidentally wipe history.
 PATCHABLE_FIELDS = {
     "reporter",
-    "subject",
+    "notes",
     "reason",
     "status",
     "assigned_agent",
