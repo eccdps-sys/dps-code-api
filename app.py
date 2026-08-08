@@ -189,6 +189,7 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
         "timeline": [serialize_timeline(r) for r in timeline_rows],
         "created_at": report_row.get("created_at"),
         "updated_at": report_row.get("updated_at"),
+        "is_supervisor": report_row.get("is_supervisor"),
     }
 
 
@@ -326,7 +327,7 @@ def create_report():
             "assigned_agent": assigned_agent,
             "created_at": now,
             "updated_at": now,
-            "is_supervisor": payload["is_supervisor"]
+            "is_supervisor": payload.get("is_supervisor", False)
         }
         supabase.table(REPORTS_TABLE).insert(insert_row).execute()
 
