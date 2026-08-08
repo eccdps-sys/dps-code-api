@@ -71,6 +71,7 @@ PATCHABLE_FIELDS = {
     "reason",
     "status",
     "assigned_agent",
+    "is_supervisor"
 }
 
 
@@ -325,6 +326,7 @@ def create_report():
             "assigned_agent": assigned_agent,
             "created_at": now,
             "updated_at": now,
+            "is_supervisor": payload["is_supervisor"]
         }
         supabase.table(REPORTS_TABLE).insert(insert_row).execute()
 
