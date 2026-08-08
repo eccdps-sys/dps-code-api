@@ -59,13 +59,14 @@ NOTES_TABLE = "notes"
 EVIDENCE_TABLE = "evidence"
 TIMELINE_TABLE = "timeline"
 
-REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reason"]
+REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reported", "reason"]
 
 # Fields that BotGhost/clients are allowed to directly overwrite via PATCH.
 # notes/evidence/timeline stay append-only via their dedicated endpoints,
 # so a PATCH can't accidentally wipe history.
 PATCHABLE_FIELDS = {
     "reporter",
+    "reported",
     "notes",
     "reason",
     "status",
@@ -178,6 +179,7 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
     return {
         "report_id": report_row["report_id"],
         "reporter": report_row.get("reporter"),
+        "reported": report_row.get("reported"),
         "reason": report_row.get("reason"),
         "status": report_row.get("status"),
         "assigned_agent": report_row.get("assigned_agent"),
@@ -315,6 +317,7 @@ def create_report():
         insert_row = {
             "report_id": report_id,
             "reporter": payload["reporter"],
+            "reported": payload["reported"],
             "reason": payload["reason"],
             "notes": "",
             "evidence": "",
