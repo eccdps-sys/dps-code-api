@@ -178,7 +178,6 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
     return {
         "report_id": report_row["report_id"],
         "reporter": report_row.get("reporter"),
-        "subject": report_row.get("subject"),
         "reason": report_row.get("reason"),
         "status": report_row.get("status"),
         "assigned_agent": report_row.get("assigned_agent"),
@@ -316,7 +315,6 @@ def create_report():
         insert_row = {
             "report_id": report_id,
             "reporter": payload["reporter"],
-            "subject": payload["subject"],
             "reason": payload["reason"],
             "notes": "",
             "evidence": "",
