@@ -1,12 +1,26 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, request, session
 import random
 import string
 import os
+import json
+import secrets
 from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from postgrest.exceptions import APIError
 from supabase import create_client, Client
 
 app = Flask(__name__)
+
+# Browser sessions are used only by the DPS dashboard. BotGhost continues to
+# authenticate with API_KEY, so it does not need a browser session.
+app.config.update(
+    SECRET_KEY=os.environ.get("OAUTH_SESSION_SECRET"),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "true").lower() == "true",
+    SESSION_COOKIE_SAMESITE="None",
+)
 
 # =====================
 # SECURITY
@@ -15,12 +29,87 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY")
 
+DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
+DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
+DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "").rstrip("/")
+
+# Change these values to adjust dashboard access later. Every protected API
+# route checks this map, so hiding a button in the UI is never the only guard.
+CLEARANCE_POLICY = {
+    "view_dashboard": 1,
+    "view_agents": 1,
+    "view_analytics": 2,
+    "add_case_note": 1,
+    "add_evidence": 1,
+    "manage_dockets": 2,
+    "reassign_docket": 3,
+    "decide_appeal": 4,
+    "manage_agents": 5,
+    "delete_docket": 5,
+}
+
 
 def verify_api_key():
     auth = request.headers.get("Authorization")
-    if auth != API_KEY:
+    return bool(API_KEY) and bool(auth) and secrets.compare_digest(auth, API_KEY)
+
+
+def oauth_configured():
+    return all([
+        app.config.get("SECRET_KEY"),
+        DISCORD_CLIENT_ID,
+        DISCORD_CLIENT_SECRET,
+        DISCORD_REDIRECT_URI,
+        DASHBOARD_ORIGIN,
+    ])
+
+
+def active_agent_from_session():
+    """Return the live agent row for this browser session, if eligible."""
+    discord_id = session.get("discord_id")
+    if not discord_id:
+        return None
+
+    row = db_get_agent_row(str(discord_id))
+    if not row or str(row.get("status") or "").strip().lower() != "active":
+        session.clear()
+        return None
+    return row
+
+
+def has_permission(agent_row, permission):
+    try:
+        level = int(agent_row.get("clearance_level"))
+    except (TypeError, ValueError):
         return False
-    return True
+    return level >= CLEARANCE_POLICY[permission]
+
+
+def authorize_dashboard(permission):
+    """Permit BotGhost's API key or an active, cleared browser session."""
+    if verify_api_key():
+        return None
+
+    agent_row = active_agent_from_session()
+    if not agent_row:
+        return error_response("Sign-in required", 401)
+    if not has_permission(agent_row, permission):
+        return error_response("Insufficient clearance", 403)
+    return None
+
+
+@app.after_request
+def apply_dashboard_cors(response):
+    """Allow credentialed requests only from the configured dashboard URL."""
+    origin = request.headers.get("Origin")
+    if origin and origin == DASHBOARD_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+        response.headers.add("Vary", "Origin")
+    return response
 
 
 # =====================
@@ -270,6 +359,122 @@ def home():
 
 
 # =====================
+# DASHBOARD AUTHENTICATION
+# =====================
+
+def dashboard_redirect(path, **params):
+    query = urlencode(params)
+    suffix = f"?{query}" if query else ""
+    return redirect(f"{DASHBOARD_ORIGIN}{path}{suffix}")
+
+
+def discord_json_request(url, method="GET", data=None):
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        data = urlencode(data).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = Request(url, data=data, headers=headers, method=method)
+    with urlopen(req, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+@app.route("/auth/discord/login", methods=["GET"])
+def discord_login():
+    if not oauth_configured():
+        return error_response("Discord OAuth is not configured", 503)
+
+    state = secrets.token_urlsafe(32)
+    session.clear()
+    session["oauth_state"] = state
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify",
+        "state": state,
+    }
+    return redirect("https://discord.com/oauth2/authorize?" + urlencode(params))
+
+
+@app.route("/auth/discord/callback", methods=["GET"])
+def discord_callback():
+    if not oauth_configured():
+        return error_response("Discord OAuth is not configured", 503)
+
+    if request.args.get("error"):
+        return dashboard_redirect("/login", error="discord_authorization_denied")
+
+    state = request.args.get("state")
+    expected_state = session.pop("oauth_state", None)
+    code = request.args.get("code")
+    if not code or not state or not expected_state or not secrets.compare_digest(state, expected_state):
+        return dashboard_redirect("/login", error="invalid_oauth_state")
+
+    try:
+        token = discord_json_request(
+            "https://discord.com/api/oauth2/token",
+            method="POST",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": DISCORD_REDIRECT_URI,
+            },
+        )
+        access_token = token.get("access_token")
+        if not access_token:
+            raise ValueError("Discord did not return an access token")
+    except (HTTPError, URLError, ValueError, json.JSONDecodeError):
+        return dashboard_redirect("/login", error="discord_verification_failed")
+
+    # /users/@me requires the access token; use a separate authenticated call.
+    try:
+        req = Request(
+            "https://discord.com/api/users/@me",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {access_token}"},
+        )
+        with urlopen(req, timeout=10) as response:
+            user = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, json.JSONDecodeError):
+        return dashboard_redirect("/login", error="discord_verification_failed")
+
+    discord_id = str(user.get("id", "")).strip()
+    agent = db_get_agent_row(discord_id) if discord_id else None
+    if not agent:
+        return dashboard_redirect("/login", error="not_a_dps_agent")
+    if str(agent.get("status") or "").strip().lower() != "active":
+        return dashboard_redirect("/login", error="agent_not_active")
+
+    session.clear()
+    session["discord_id"] = discord_id
+    return dashboard_redirect("/dashboard")
+
+
+@app.route("/auth/me", methods=["GET"])
+def auth_me():
+    agent = active_agent_from_session()
+    if not agent:
+        return error_response("Sign-in required", 401)
+
+    return jsonify({
+        "success": True,
+        "agent": serialize_agent(agent),
+        "permissions": {
+            permission: has_permission(agent, permission)
+            for permission in CLEARANCE_POLICY
+        },
+        "minimum_clearances": CLEARANCE_POLICY,
+    }), 200
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    session.clear()
+    return jsonify({"success": True}), 200
+
+
+# =====================
 # AGREEMENT CODE
 # =====================
 
@@ -347,8 +552,9 @@ def clearance():
 
 @app.route("/reports/create", methods=["POST"])
 def create_report():
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -404,8 +610,9 @@ def create_report():
 
 @app.route("/reports/<report_id>", methods=["GET"])
 def get_report(report_id):
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("view_dashboard")
+    if denied:
+        return denied
 
     try:
         row = db_get_report_row(report_id)
@@ -426,8 +633,9 @@ def list_reports():
     Optional convenience endpoint: list all reports, with optional
     ?status=Open filtering. Handy for BotGhost embeds that show open cases.
     """
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("view_dashboard")
+    if denied:
+        return denied
 
     status_filter = request.args.get("status")
 
@@ -448,8 +656,9 @@ def list_reports():
 
 @app.route("/reports/<report_id>/update", methods=["PATCH"])
 def update_report(report_id):
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -505,8 +714,9 @@ def update_report(report_id):
 
 @app.route("/reports/<report_id>/notes", methods=["POST"])
 def add_note(report_id):
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("add_case_note")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -560,8 +770,9 @@ def add_note(report_id):
 
 @app.route("/reports/<report_id>/evidence", methods=["POST"])
 def add_evidence(report_id):
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("add_evidence")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -622,8 +833,9 @@ def add_evidence(report_id):
 
 @app.route("/reports/<report_id>/timeline", methods=["POST"])
 def add_timeline_event(report_id):
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -672,8 +884,9 @@ def delete_report(report_id):
     Hard-delete a report. Child rows in notes/evidence/timeline are removed
     automatically via ON DELETE CASCADE in the schema.
     """
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("delete_docket")
+    if denied:
+        return denied
 
     try:
         existing = db_get_report_row(report_id)
@@ -738,8 +951,9 @@ def create_agent():
     is even done. Only discord_id is required -- everything else gets
     posted in later via /update as the bot generates it.
     """
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("manage_agents")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -791,8 +1005,9 @@ def update_agent(discord_id):
     agent_id/clearance_id/clearance_level after training. No generation
     happens in this API; it only stores what's sent.
     """
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("manage_agents")
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True)
     if payload is None:
@@ -849,8 +1064,9 @@ def update_agent(discord_id):
 
 @app.route("/agents/<discord_id>", methods=["GET"])
 def get_agent(discord_id):
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("view_agents")
+    if denied:
+        return denied
 
     try:
         row = db_get_agent_row(discord_id)
@@ -871,8 +1087,9 @@ def list_agents():
     List all agents, with optional ?status=onboarding or ?status=active
     filtering. Handy for BotGhost embeds and the dashboard's Agents page.
     """
-    if not verify_api_key():
-        return error_response("Unauthorized", 401)
+    denied = authorize_dashboard("view_agents")
+    if denied:
+        return denied
 
     status_filter = request.args.get("status")
 
