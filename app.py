@@ -12,6 +12,7 @@ app = Flask(__name__)
 # SECURITY
 # (unchanged from the original app.py)
 # =====================
+
 API_KEY = os.environ.get("API_KEY")
 
 
@@ -26,6 +27,7 @@ def verify_api_key():
 # GENERATORS
 # (unchanged from the original app.py)
 # =====================
+
 def numbers(amount):
     return ''.join(random.choice(string.digits) for _ in range(amount))
 
@@ -44,6 +46,7 @@ def letters(amount):
 # be the *service_role* key (Project Settings -> API -> service_role),
 # never the anon/public key, since this server writes on behalf of every
 # BotGhost user and must bypass Row Level Security.
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -58,6 +61,7 @@ REPORTS_TABLE = "reports"
 NOTES_TABLE = "notes"
 EVIDENCE_TABLE = "evidence"
 TIMELINE_TABLE = "timeline"
+AGENTS_TABLE = "agents"
 
 REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reported", "reason"]
 
@@ -84,6 +88,10 @@ def error_response(message, status_code):
 
 
 class ReportNotFound(Exception):
+    pass
+
+
+class AgentNotFound(Exception):
     pass
 
 
@@ -139,6 +147,19 @@ def db_get_timeline(report_id):
     return resp.data or []
 
 
+def db_get_agent_row(discord_id):
+    """Fetch the raw agents row by discord_id (the primary key), or None."""
+    resp = (
+        supabase.table(AGENTS_TABLE)
+        .select("*")
+        .eq("discord_id", discord_id)
+        .limit(1)
+        .execute()
+    )
+    rows = resp.data or []
+    return rows[0] if rows else None
+
+
 def serialize_note(row):
     return {
         "note": row.get("note"),
@@ -161,6 +182,23 @@ def serialize_timeline(row):
         "event": row.get("event"),
         "by": row.get("by"),
         "timestamp": row.get("created_at"),
+    }
+
+
+def serialize_agent(row):
+    """Public shape for an agents row. Nullable fields stay null/absent
+    until the agent has actually reached that onboarding phase."""
+    return {
+        "discord_id": row.get("discord_id"),
+        "name": row.get("name"),
+        "status": row.get("status"),
+        "security_id": row.get("security_id"),
+        "agreement_id": row.get("agreement_id"),
+        "agent_id": row.get("agent_id"),
+        "clearance_level": row.get("clearance_level"),
+        "clearance_id": row.get("clearance_id"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
     }
 
 
@@ -200,6 +238,13 @@ def fetch_full_report_or_raise(report_id):
     return build_report_json(row)
 
 
+def fetch_agent_or_raise(discord_id):
+    row = db_get_agent_row(discord_id)
+    if row is None:
+        raise AgentNotFound(discord_id)
+    return serialize_agent(row)
+
+
 def _summarize_notes_column(notes_rows):
     """Builds the flat, human-readable reports.notes TEXT column."""
     return " | ".join(
@@ -218,6 +263,7 @@ def _summarize_evidence_column(evidence_rows):
 # =====================
 # HOME
 # =====================
+
 @app.route("/")
 def home():
     return "DPS API Online"
@@ -226,6 +272,7 @@ def home():
 # =====================
 # AGREEMENT CODE
 # =====================
+
 @app.route("/generate/agreement")
 def agreement():
     if not verify_api_key():
@@ -237,6 +284,7 @@ def agreement():
 # =====================
 # AGENT ID
 # =====================
+
 @app.route("/generate/agent")
 def agent():
     if not verify_api_key():
@@ -248,6 +296,7 @@ def agent():
 # =====================
 # JOIN CODE
 # =====================
+
 @app.route("/generate/join")
 def join():
     if not verify_api_key():
@@ -259,6 +308,7 @@ def join():
 # =====================
 # CASE NUMBER
 # =====================
+
 @app.route("/generate/case")
 def case():
     if not verify_api_key():
@@ -270,6 +320,7 @@ def case():
 # =====================
 # INVESTIGATION ID
 # =====================
+
 @app.route("/generate/investigation")
 def investigation():
     if not verify_api_key():
@@ -281,6 +332,7 @@ def investigation():
 # =====================
 # CLEARANCE ID
 # =====================
+
 @app.route("/generate/clearance")
 def clearance():
     if not verify_api_key():
@@ -329,6 +381,7 @@ def create_report():
             "updated_at": now,
             "is_supervisor": payload.get("is_supervisor", False)
         }
+
         supabase.table(REPORTS_TABLE).insert(insert_row).execute()
 
         # Seed timeline with a "Report created" entry, matching prior behavior.
@@ -340,6 +393,7 @@ def create_report():
         }).execute()
 
         report = fetch_full_report_or_raise(report_id)
+
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
@@ -438,6 +492,7 @@ def update_report(report_id):
             }).execute()
 
         report = fetch_full_report_or_raise(report_id)
+
     except ReportNotFound:
         return error_response(f"Report '{report_id}' not found", 404)
     except APIError as e:
@@ -485,7 +540,6 @@ def add_note(report_id):
         }).execute()
 
         notes_rows = db_get_notes(report_id)
-
         supabase.table(REPORTS_TABLE).update({
             "notes": _summarize_notes_column(notes_rows),
             "updated_at": now,
@@ -493,6 +547,7 @@ def add_note(report_id):
 
         entry = {"note": note_text, "author": author, "timestamp": now}
         report = fetch_full_report_or_raise(report_id)
+
     except ReportNotFound:
         return error_response(f"Report '{report_id}' not found", 404)
     except APIError as e:
@@ -542,7 +597,6 @@ def add_evidence(report_id):
         }).execute()
 
         evidence_rows = db_get_evidence(report_id)
-
         supabase.table(REPORTS_TABLE).update({
             "evidence": _summarize_evidence_column(evidence_rows),
             "updated_at": now,
@@ -555,6 +609,7 @@ def add_evidence(report_id):
             "timestamp": now,
         }
         report = fetch_full_report_or_raise(report_id)
+
     except ReportNotFound:
         return error_response(f"Report '{report_id}' not found", 404)
     except APIError as e:
@@ -600,6 +655,7 @@ def add_timeline_event(report_id):
 
         entry = {"event": event_text, "by": by, "timestamp": now}
         report = fetch_full_report_or_raise(report_id)
+
     except ReportNotFound:
         return error_response(f"Report '{report_id}' not found", 404)
     except APIError as e:
@@ -625,6 +681,7 @@ def delete_report(report_id):
             return error_response(f"Report '{report_id}' not found", 404)
 
         supabase.table(REPORTS_TABLE).delete().eq("report_id", report_id).execute()
+
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
@@ -633,9 +690,211 @@ def delete_report(report_id):
     return jsonify({"success": True, "deleted": report_id}), 200
 
 
+# =====================================================================
+# AGENT ONBOARDING
+# =====================================================================
+# The Discord bot already generates every ID (security_id, agreement_id,
+# agent_id, clearance_id) itself via the existing /generate/* endpoints
+# above. This API does NOT regenerate anything -- it just stores whatever
+# the bot already generated and posts in, as each phase completes.
+#
+# discord_id is the primary key (known from the moment onboarding starts,
+# unlike agent_id which doesn't exist until training completes). Every
+# onboarding-specific field is nullable until the bot posts it in:
+#
+#   POST  /agents/create           -> row created with discord_id, status "onboarding"
+#   PATCH /agents/<discord_id>/update -> post whitelisted fields as they're
+#                                         generated (security_id + agreement_id
+#                                         after Phase 2, agent_id + clearance_id +
+#                                         clearance_level after training, etc.)
+#   GET   /agents/<discord_id>
+#   GET   /agents
+#
+# Per the same rule that governs reports: a write here does NOT create a
+# timeline/history event. Onboarding step history lives on Discord and
+# stays there -- there is no agents-equivalent timeline table.
+
+AGENT_REQUIRED_CREATE_FIELDS = ["discord_id"]
+
+# Fields the bot is allowed to post in via PATCH /agents/<discord_id>/update.
+# All of these are generated/decided elsewhere (the bot's own /generate/*
+# calls, or a Lead Agent/Director manually setting clearance_level) --
+# this endpoint just stores them.
+AGENT_PATCHABLE_FIELDS = {
+    "name",
+    "status",
+    "security_id",
+    "agreement_id",
+    "agent_id",
+    "clearance_level",
+    "clearance_id",
+}
+
+
+@app.route("/agents/create", methods=["POST"])
+def create_agent():
+    """
+    Creates the agents row the moment onboarding begins, before Phase 2
+    is even done. Only discord_id is required -- everything else gets
+    posted in later via /update as the bot generates it.
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response("Request body must be valid JSON", 400)
+
+    missing = [f for f in AGENT_REQUIRED_CREATE_FIELDS if not str(payload.get(f, "")).strip()]
+    if missing:
+        return error_response(f"Missing required field(s): {', '.join(missing)}", 400)
+
+    discord_id = str(payload["discord_id"]).strip()
+
+    try:
+        existing = db_get_agent_row(discord_id)
+        if existing is not None:
+            return error_response(f"Agent '{discord_id}' already exists", 409)
+
+        now = _now_iso()
+        insert_row = {
+            "discord_id": discord_id,
+            "name": payload.get("name"),
+            "status": payload.get("status", "onboarding"),
+            "security_id": None,
+            "agreement_id": None,
+            "agent_id": None,
+            "clearance_level": None,
+            "clearance_id": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        supabase.table(AGENTS_TABLE).insert(insert_row).execute()
+
+        agent_obj = fetch_agent_or_raise(discord_id)
+
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "agent": agent_obj}), 201
+
+
+@app.route("/agents/<discord_id>/update", methods=["PATCH"])
+def update_agent(discord_id):
+    """
+    Posts already-generated fields onto an existing agent row -- e.g. the
+    bot calls /generate/join + /generate/agreement after Phase 2, then
+    PATCHes security_id/agreement_id here. Same shape later for
+    agent_id/clearance_id/clearance_level after training. No generation
+    happens in this API; it only stores what's sent.
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response("Request body must be valid JSON", 400)
+
+    disallowed = [k for k in payload.keys() if k not in AGENT_PATCHABLE_FIELDS]
+    if disallowed:
+        return error_response(
+            f"Field(s) not updatable via /update: {', '.join(disallowed)}.",
+            400,
+        )
+
+    if not payload:
+        return error_response("No updatable fields provided", 400)
+
+    if "clearance_level" in payload and payload["clearance_level"] is not None:
+        try:
+            level = int(payload["clearance_level"])
+        except (TypeError, ValueError):
+            return error_response("Field 'clearance_level' must be an integer", 400)
+        if level < 1 or level > 5:
+            return error_response("Field 'clearance_level' must be between 1 and 5", 400)
+        payload["clearance_level"] = level
+
+    try:
+        existing = db_get_agent_row(discord_id)
+        if existing is None:
+            return error_response(f"Agent '{discord_id}' not found", 404)
+
+        changed_fields = [
+            field for field, value in payload.items() if existing.get(field) != value
+        ]
+
+        if changed_fields:
+            now = _now_iso()
+            update_data = {field: payload[field] for field in changed_fields}
+            update_data["updated_at"] = now
+
+            supabase.table(AGENTS_TABLE).update(update_data).eq(
+                "discord_id", discord_id
+            ).execute()
+
+        agent_obj = fetch_agent_or_raise(discord_id)
+
+    except AgentNotFound:
+        return error_response(f"Agent '{discord_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "agent": agent_obj}), 200
+
+
+@app.route("/agents/<discord_id>", methods=["GET"])
+def get_agent(discord_id):
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    try:
+        row = db_get_agent_row(discord_id)
+        if row is None:
+            return error_response(f"Agent '{discord_id}' not found", 404)
+        agent_obj = serialize_agent(row)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "agent": agent_obj}), 200
+
+
+@app.route("/agents", methods=["GET"])
+def list_agents():
+    """
+    List all agents, with optional ?status=onboarding or ?status=active
+    filtering. Handy for BotGhost embeds and the dashboard's Agents page.
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    status_filter = request.args.get("status")
+
+    try:
+        query = supabase.table(AGENTS_TABLE).select("*").order("created_at", desc=True)
+        if status_filter:
+            query = query.ilike("status", status_filter)
+        resp = query.execute()
+        rows = resp.data or []
+        agents_list = [serialize_agent(row) for row in rows]
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "count": len(agents_list), "agents": agents_list}), 200
+
+
 # =====================
 # ERROR HANDLERS
 # =====================
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({"success": False, "error": "Endpoint not found"}), 404
