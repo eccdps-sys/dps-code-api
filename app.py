@@ -19,7 +19,10 @@ app.config.update(
     SECRET_KEY=os.environ.get("OAUTH_SESSION_SECRET"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "true").lower() == "true",
-    SESSION_COOKIE_SAMESITE="Lax",
+    # Discord returns to this API through a top-level GET redirect. Lax keeps
+    # the OAuth state cookie available there without relying on third-party
+    # cookie support.
+    SESSION_COOKIE_SAMESITE=os.environ.get("SESSION_COOKIE_SAMESITE", "Lax"),
 )
 
 # =====================
@@ -407,8 +410,14 @@ def discord_callback():
     state = request.args.get("state")
     expected_state = session.pop("oauth_state", None)
     code = request.args.get("code")
-    if not code or not state or not expected_state or not secrets.compare_digest(state, expected_state):
-        return dashboard_redirect("/login", error="invalid_oauth_state")
+    if not code:
+        return dashboard_redirect("/login", error="missing_oauth_code")
+    if not state:
+        return dashboard_redirect("/login", error="missing_oauth_state")
+    if not expected_state:
+        return dashboard_redirect("/login", error="missing_saved_oauth_state")
+    if not secrets.compare_digest(state, expected_state):
+        return dashboard_redirect("/login", error="oauth_state_mismatch")
 
     try:
         token = discord_json_request(
