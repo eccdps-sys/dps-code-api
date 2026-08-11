@@ -371,6 +371,29 @@ def dashboard_redirect(path, **params):
     return redirect(f"{DASHBOARD_ORIGIN}{path}{suffix}")
 
 
+def oauth_popup_page(success, error=None):
+    """Notify the dashboard opener, then close an OAuth popup window."""
+    message = {"type": "ecc-dps-oauth", "success": success}
+    if error:
+        message["error"] = error
+    return (
+        "<!doctype html><title>ECC DPS sign-in</title>"
+        "<p>Sign-in complete. This window will close automatically.</p>"
+        "<script>"
+        f"window.opener?.postMessage({json.dumps(message)}, {json.dumps(DASHBOARD_ORIGIN)});"
+        "window.close();"
+        "</script>",
+        200,
+        {"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+def oauth_failure(error):
+    if session.pop("oauth_popup", False):
+        return oauth_popup_page(False, error)
+    return dashboard_redirect("/login", error=error)
+
+
 def discord_json_request(url, method="GET", data=None):
     headers = {"Accept": "application/json"}
     if data is not None:
@@ -389,6 +412,7 @@ def discord_login():
     state = secrets.token_urlsafe(32)
     session.clear()
     session["oauth_state"] = state
+    session["oauth_popup"] = request.args.get("popup") == "1"
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -405,19 +429,19 @@ def discord_callback():
         return error_response("Discord OAuth is not configured", 503)
 
     if request.args.get("error"):
-        return dashboard_redirect("/login", error="discord_authorization_denied")
+        return oauth_failure("discord_authorization_denied")
 
     state = request.args.get("state")
     expected_state = session.pop("oauth_state", None)
     code = request.args.get("code")
     if not code:
-        return dashboard_redirect("/login", error="missing_oauth_code")
+        return oauth_failure("missing_oauth_code")
     if not state:
-        return dashboard_redirect("/login", error="missing_oauth_state")
+        return oauth_failure("missing_oauth_state")
     if not expected_state:
-        return dashboard_redirect("/login", error="missing_saved_oauth_state")
+        return oauth_failure("missing_saved_oauth_state")
     if not secrets.compare_digest(state, expected_state):
-        return dashboard_redirect("/login", error="oauth_state_mismatch")
+        return oauth_failure("oauth_state_mismatch")
 
     try:
         token = discord_json_request(
@@ -435,7 +459,7 @@ def discord_callback():
         if not access_token:
             raise ValueError("Discord did not return an access token")
     except (HTTPError, URLError, ValueError, json.JSONDecodeError):
-        return dashboard_redirect("/login", error="discord_verification_failed")
+        return oauth_failure("discord_verification_failed")
 
     # /users/@me requires the access token; use a separate authenticated call.
     try:
@@ -446,17 +470,20 @@ def discord_callback():
         with urlopen(req, timeout=10) as response:
             user = json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, json.JSONDecodeError):
-        return dashboard_redirect("/login", error="discord_verification_failed")
+        return oauth_failure("discord_verification_failed")
 
     discord_id = str(user.get("id", "")).strip()
     agent = db_get_agent_row(discord_id) if discord_id else None
     if not agent:
-        return dashboard_redirect("/login", error="not_a_dps_agent")
+        return oauth_failure("not_a_dps_agent")
     if str(agent.get("status") or "").strip().lower() != "active":
-        return dashboard_redirect("/login", error="agent_not_active")
+        return oauth_failure("agent_not_active")
 
+    popup = session.pop("oauth_popup", False)
     session.clear()
     session["discord_id"] = discord_id
+    if popup:
+        return oauth_popup_page(True)
     return dashboard_redirect("/dashboard")
 
 
