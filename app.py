@@ -19,7 +19,7 @@ app.config.update(
     SECRET_KEY=os.environ.get("OAUTH_SESSION_SECRET"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "true").lower() == "true",
-    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SAMESITE="Lax",
 )
 
 # =====================
