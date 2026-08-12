@@ -395,7 +395,12 @@ def oauth_failure(error):
 
 
 def discord_json_request(url, method="GET", data=None):
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        # Discord's API (fronted by Cloudflare) rejects the default
+        # Python-urllib user-agent. Identify the app explicitly.
+        "User-Agent": "ECCDPSDashboard/1.0 (+https://api.eccdps.org)",
+    }
     if data is not None:
         data = urlencode(data).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -493,7 +498,11 @@ def discord_callback():
     try:
         req = Request(
             "https://discord.com/api/users/@me",
-            headers={"Accept": "application/json", "Authorization": f"Bearer {access_token}"},
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": "ECCDPSDashboard/1.0 (+https://api.eccdps.org)",
+            },
         )
         with urlopen(req, timeout=15) as response:
             user = json.loads(response.read().decode("utf-8"))
