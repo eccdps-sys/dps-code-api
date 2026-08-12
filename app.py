@@ -400,8 +400,27 @@ def discord_json_request(url, method="GET", data=None):
         data = urlencode(data).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     req = Request(url, data=data, headers=headers, method=method)
-    with urlopen(req, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(req, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        # Read and re-raise with the Discord error body attached so callers
+        # can log or surface the real reason (e.g. invalid_client,
+        # redirect_uri_mismatch, invalid_grant).
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {"raw": body}
+        raise DiscordAPIError(e.code, parsed) from e
+
+
+class DiscordAPIError(Exception):
+    """Wraps a Discord HTTP error with its parsed JSON body."""
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+        super().__init__(f"Discord API {status}: {body}")
 
 
 @app.route("/auth/discord/login", methods=["GET"])
@@ -458,7 +477,16 @@ def discord_callback():
         access_token = token.get("access_token")
         if not access_token:
             raise ValueError("Discord did not return an access token")
-    except (HTTPError, URLError, ValueError, json.JSONDecodeError):
+    except DiscordAPIError as e:
+        discord_error = e.body.get("error", "") if isinstance(e.body, dict) else ""
+        app.logger.error("Discord token exchange failed (HTTP %s): %s", e.status, e.body)
+        if discord_error == "redirect_uri_mismatch":
+            return oauth_failure("discord_redirect_uri_mismatch")
+        if discord_error in ("invalid_client", "unauthorized_client"):
+            return oauth_failure("discord_client_misconfigured")
+        return oauth_failure("discord_verification_failed")
+    except (URLError, ValueError, json.JSONDecodeError) as e:
+        app.logger.error("Discord token exchange error: %s", e)
         return oauth_failure("discord_verification_failed")
 
     # /users/@me requires the access token; use a separate authenticated call.
@@ -467,9 +495,10 @@ def discord_callback():
             "https://discord.com/api/users/@me",
             headers={"Accept": "application/json", "Authorization": f"Bearer {access_token}"},
         )
-        with urlopen(req, timeout=10) as response:
+        with urlopen(req, timeout=15) as response:
             user = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, json.JSONDecodeError):
+    except (DiscordAPIError, URLError, json.JSONDecodeError) as e:
+        app.logger.error("Discord /users/@me failed: %s", e)
         return oauth_failure("discord_verification_failed")
 
     discord_id = str(user.get("id", "")).strip()
@@ -692,10 +721,6 @@ def list_reports():
 
 @app.route("/reports/<report_id>/update", methods=["PATCH"])
 def update_report(report_id):
-    denied = authorize_dashboard("manage_dockets")
-    if denied:
-        return denied
-
     payload = request.get_json(silent=True)
     if payload is None:
         return error_response("Request body must be valid JSON", 400)
@@ -710,6 +735,12 @@ def update_report(report_id):
 
     if not payload:
         return error_response("No updatable fields provided", 400)
+
+    # Reassignment is intentionally stricter than ordinary status/field edits.
+    permission = "reassign_docket" if "assigned_agent" in payload else "manage_dockets"
+    denied = authorize_dashboard(permission)
+    if denied:
+        return denied
 
     try:
         existing = db_get_report_row(report_id)
@@ -763,6 +794,9 @@ def add_note(report_id):
         return error_response("Field 'note' is required", 400)
 
     author = str(payload.get("author", "Unknown")).strip() or "Unknown"
+    if not verify_api_key():
+        agent = active_agent_from_session()
+        author = (agent or {}).get("name") or (agent or {}).get("agent_id") or author
 
     try:
         existing = db_get_report_row(report_id)
@@ -819,6 +853,9 @@ def add_evidence(report_id):
         return error_response("Field 'description' is required", 400)
 
     submitted_by = str(payload.get("submitted_by", "Unknown")).strip() or "Unknown"
+    if not verify_api_key():
+        agent = active_agent_from_session()
+        submitted_by = (agent or {}).get("name") or (agent or {}).get("agent_id") or submitted_by
     url = payload.get("url", "")
 
     try:
