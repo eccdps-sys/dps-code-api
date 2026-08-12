@@ -885,11 +885,31 @@ def list_reports():
         query = supabase.table(REPORTS_TABLE).select("*").order("created_at", desc=True)
         if status_filter:
             query = query.ilike("status", status_filter)
-        if not can_supervisor:
-            query = query.eq("is_supervisor", False)
         resp = query.execute()
         rows = resp.data or []
-        reports = [build_report_json(row) for row in rows]
+        reports = []
+        for row in rows:
+            if row.get("is_supervisor") and not can_supervisor:
+                # Return a minimal stub so the dashboard can render a locked row.
+                # No sensitive fields are included — only enough to show the lock UI.
+                reports.append({
+                    "report_id": row["report_id"],
+                    "is_supervisor": True,
+                    "restricted": True,
+                    "reporter": None,
+                    "reported": None,
+                    "reason": None,
+                    "status": None,
+                    "assigned_agent": None,
+                    "notes": [],
+                    "evidence": [],
+                    "timeline": [],
+                    "created_at": None,
+                    "updated_at": None,
+                    "thread_id": None,
+                })
+            else:
+                reports.append(build_report_json(row))
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
