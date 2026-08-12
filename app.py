@@ -4,6 +4,7 @@ import string
 import os
 import json
 import secrets
+import threading
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -36,6 +37,97 @@ DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
 DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "").rstrip("/")
+
+# Webhook URL for the forum channel where report threads live.
+# Set DISCORD_AUDIT_WEBHOOK on Render to enable audit trail messages.
+DISCORD_AUDIT_WEBHOOK = os.environ.get("DISCORD_AUDIT_WEBHOOK", "").strip()
+# Separate webhook for the supervisor-only forum channel.
+DISCORD_AUDIT_WEBHOOK_SUPERVISOR = os.environ.get("DISCORD_AUDIT_WEBHOOK_SUPERVISOR", "").strip()
+
+# Ranks that are permitted to view and action supervisor reports.
+# Anything below Senior Agent is blocked at the API level.
+SUPERVISOR_RANKS = {
+    "Senior Agent",
+    "Head Investigator",
+    "Lead Agent",
+    "Director",
+}
+
+# =====================================================================
+# DISCORD AUDIT TRAIL
+# Posts a lightweight embed into the report's forum thread whenever a
+# dashboard agent takes an action. Runs in a background thread so it
+# never slows down the API response. Silently no-ops if the webhook URL
+# is not configured or the report has no thread_id stored.
+# =====================================================================
+
+# Emoji prefix per action type — keeps messages scannable at a glance.
+_AUDIT_ICONS = {
+    "viewed":    "👁️",
+    "created":   "📋",
+    "note":      "📝",
+    "evidence":  "📎",
+    "status":    "🔄",
+    "reassign":  "👤",
+    "field":     "✏️",
+    "deleted":   "🗑️",
+    "timeline":  "📌",
+}
+
+def _post_webhook(url: str, payload: dict):
+    """Fire-and-forget POST to a Discord webhook URL."""
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "ECCDPSDashboard/1.0 (+https://api.eccdps.org)",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=10):
+            pass
+    except Exception as exc:
+        app.logger.warning("Discord audit webhook failed: %s", exc)
+
+
+def send_to_thread(thread_id: str | None, action: str, by: str, detail: str = "", is_supervisor: bool = False):
+    """
+    Post an audit message into the report's Discord forum thread.
+
+    thread_id     – Discord thread/channel ID stored on the report row.
+                    If None or empty, this is a no-op.
+    action        – key from _AUDIT_ICONS (e.g. "status", "note").
+    by            – display name of the agent who performed the action.
+    detail        – optional one-line description appended after the action label.
+    is_supervisor – selects the supervisor webhook when True.
+    """
+    webhook = DISCORD_AUDIT_WEBHOOK_SUPERVISOR if is_supervisor else DISCORD_AUDIT_WEBHOOK
+    if not webhook or not thread_id:
+        return
+
+    icon  = _AUDIT_ICONS.get(action, "🔔")
+    label = action.replace("_", " ").title()
+    description = f"{icon} **{label}**"
+    if detail:
+        description += f" — {detail}"
+    description += f"\nBy **{by}**"
+
+    payload = {
+        "embeds": [{
+            "description": description,
+            "color": 0xE67E22 if is_supervisor else 0x5865F2,
+            "footer": {
+                "text": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
+            },
+        }]
+    }
+
+    url = f"{webhook}?thread_id={thread_id}&wait=false"
+    t = threading.Thread(target=_post_webhook, args=(url, payload), daemon=True)
+    t.start()
 
 # Change these values to adjust dashboard access later. Every protected API
 # route checks this map, so hiding a button in the UI is never the only guard.
@@ -89,8 +181,18 @@ def has_permission(agent_row, permission):
     return level >= CLEARANCE_POLICY[permission]
 
 
-def authorize_dashboard(permission):
-    """Permit BotGhost's API key or an active, cleared browser session."""
+def has_supervisor_access(agent_row):
+    """Return True if the agent's rank permits handling supervisor reports."""
+    rank = str(agent_row.get("agent_rank") or "").strip()
+    return rank in SUPERVISOR_RANKS
+
+
+def authorize_dashboard(permission, report_row=None):
+    """Permit BotGhost's API key or an active, cleared browser session.
+
+    If report_row is supplied and is a supervisor report, also enforces
+    that the agent holds a supervisor-eligible rank.
+    """
     if verify_api_key():
         return None
 
@@ -99,6 +201,9 @@ def authorize_dashboard(permission):
         return error_response("Sign-in required", 401)
     if not has_permission(agent_row, permission):
         return error_response("Insufficient clearance", 403)
+    if report_row is not None and report_row.get("is_supervisor"):
+        if not has_supervisor_access(agent_row):
+            return error_response("Supervisor reports require Senior Agent rank or above", 403)
     return None
 
 
@@ -284,6 +389,7 @@ def serialize_agent(row):
         "discord_id": row.get("discord_id"),
         "name": row.get("name"),
         "status": row.get("status"),
+        "agent_rank": row.get("agent_rank"),
         "security_id": row.get("security_id"),
         "agreement_id": row.get("agreement_id"),
         "agent_id": row.get("agent_id"),
@@ -320,6 +426,7 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
         "created_at": report_row.get("created_at"),
         "updated_at": report_row.get("updated_at"),
         "is_supervisor": report_row.get("is_supervisor"),
+        "thread_id": report_row.get("thread_id"),
     }
 
 
@@ -538,6 +645,7 @@ def auth_me():
             permission: has_permission(agent, permission)
             for permission in CLEARANCE_POLICY
         },
+        "can_handle_supervisor": has_supervisor_access(agent),
         "minimum_clearances": CLEARANCE_POLICY,
     }), 200
 
@@ -659,7 +767,8 @@ def create_report():
             "assigned_agent": assigned_agent,
             "created_at": now,
             "updated_at": now,
-            "is_supervisor": payload.get("is_supervisor", False)
+            "is_supervisor": payload.get("is_supervisor", False),
+            "thread_id": str(payload["thread_id"]).strip() if payload.get("thread_id") else None,
         }
 
         supabase.table(REPORTS_TABLE).insert(insert_row).execute()
@@ -679,6 +788,11 @@ def create_report():
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
+    thread_id = insert_row.get("thread_id")
+    actor = payload.get("reporter", "Unknown")
+    send_to_thread(thread_id, "created", actor,
+                   f"`{report_id}` opened · reported: {payload['reported']}")
+
     return jsonify({"success": True, "report": report}), 201
 
 
@@ -692,6 +806,9 @@ def get_report(report_id):
         row = db_get_report_row(report_id)
         if row is None:
             return error_response(f"Report '{report_id}' not found", 404)
+        denied = authorize_dashboard("view_dashboard", row)
+        if denied:
+            return denied
         report = build_report_json(row)
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
@@ -699,6 +816,55 @@ def get_report(report_id):
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "report": report}), 200
+
+
+@app.route("/reports/<report_id>/viewed", methods=["POST"])
+def report_viewed(report_id):
+    denied = authorize_dashboard("view_dashboard")
+    if denied:
+        return denied
+
+    row = db_get_report_row(report_id)
+    if row is None:
+        return error_response(f"Report '{report_id}' not found", 404)
+
+    denied = authorize_dashboard("view_dashboard", row)
+    if denied:
+        return denied
+
+    agent_session = active_agent_from_session()
+    by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+    send_to_thread(row.get("thread_id"), "viewed", by,
+                   f"`{report_id}` opened in dashboard",
+                   is_supervisor=bool(row.get("is_supervisor")))
+
+    return jsonify({"success": True}), 200
+
+
+@app.route("/reports/<report_id>/evidence/opened", methods=["POST"])
+def evidence_opened(report_id):
+    denied = authorize_dashboard("view_dashboard")
+    if denied:
+        return denied
+
+    row = db_get_report_row(report_id)
+    if row is None:
+        return error_response(f"Report '{report_id}' not found", 404)
+
+    denied = authorize_dashboard("view_dashboard", row)
+    if denied:
+        return denied
+
+    payload = request.get_json(silent=True) or {}
+    description = str(payload.get("description", "Evidence")).strip() or "Evidence"
+
+    agent_session = active_agent_from_session()
+    by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+    send_to_thread(row.get("thread_id"), "viewed", by,
+                   f"`{report_id}` evidence opened — {description[:60]}{'…' if len(description) > 60 else ''}",
+                   is_supervisor=bool(row.get("is_supervisor")))
+
+    return jsonify({"success": True}), 200
 
 
 @app.route("/reports", methods=["GET"])
@@ -712,11 +878,15 @@ def list_reports():
         return denied
 
     status_filter = request.args.get("status")
+    # Determine whether the caller can see supervisor reports
+    can_supervisor = verify_api_key() or has_supervisor_access(active_agent_from_session() or {})
 
     try:
         query = supabase.table(REPORTS_TABLE).select("*").order("created_at", desc=True)
         if status_filter:
             query = query.ilike("status", status_filter)
+        if not can_supervisor:
+            query = query.eq("is_supervisor", False)
         resp = query.execute()
         rows = resp.data or []
         reports = [build_report_json(row) for row in rows]
@@ -756,6 +926,11 @@ def update_report(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
+        # Supervisor report rank check
+        denied = authorize_dashboard(permission, existing)
+        if denied:
+            return denied
+
         changed_fields = [
             field for field, value in payload.items() if existing.get(field) != value
         ]
@@ -785,6 +960,23 @@ def update_report(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
+    thread_id = report.get("thread_id")
+    is_sup = bool(report.get("is_supervisor"))
+    actor = request.get_json(silent=True) or {}
+    agent_session = active_agent_from_session()
+    by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+    if "assigned_agent" in (request.get_json(silent=True) or {}):
+        send_to_thread(thread_id, "reassign", by,
+                       f"`{report_id}` → {report.get('assigned_agent', 'Unassigned')}",
+                       is_supervisor=is_sup)
+    elif "status" in (request.get_json(silent=True) or {}):
+        send_to_thread(thread_id, "status", by,
+                       f"`{report_id}` → {report.get('status')}",
+                       is_supervisor=is_sup)
+    else:
+        send_to_thread(thread_id, "field", by, f"`{report_id}` fields updated",
+                       is_supervisor=is_sup)
+
     return jsonify({"success": True, "report": report}), 200
 
 
@@ -812,8 +1004,11 @@ def add_note(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        now = _now_iso()
+        denied = authorize_dashboard("add_case_note", existing)
+        if denied:
+            return denied
 
+        now = _now_iso()
         supabase.table(NOTES_TABLE).insert({
             "report_id": report_id,
             "note": note_text,
@@ -844,6 +1039,10 @@ def add_note(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
+    send_to_thread(report.get("thread_id"), "note", author,
+                   f"`{report_id}` — {note_text[:80]}{'…' if len(note_text) > 80 else ''}",
+                   is_supervisor=bool(report.get("is_supervisor")))
+
     return jsonify({"success": True, "note": entry, "report": report}), 201
 
 
@@ -871,6 +1070,10 @@ def add_evidence(report_id):
         existing = db_get_report_row(report_id)
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = authorize_dashboard("add_evidence", existing)
+        if denied:
+            return denied
 
         now = _now_iso()
 
@@ -910,6 +1113,10 @@ def add_evidence(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
+    send_to_thread(report.get("thread_id"), "evidence", submitted_by,
+                   f"`{report_id}` — {description[:80]}{'…' if len(description) > 80 else ''}",
+                   is_supervisor=bool(report.get("is_supervisor")))
+
     return jsonify({"success": True, "evidence": entry, "report": report}), 201
 
 
@@ -934,6 +1141,10 @@ def add_timeline_event(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
+        denied = authorize_dashboard("manage_dockets", existing)
+        if denied:
+            return denied
+
         now = _now_iso()
 
         supabase.table(TIMELINE_TABLE).insert({
@@ -957,6 +1168,10 @@ def add_timeline_event(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
+    send_to_thread(report.get("thread_id"), "timeline", by,
+                   f"`{report_id}` — {event_text[:80]}{'…' if len(event_text) > 80 else ''}",
+                   is_supervisor=bool(report.get("is_supervisor")))
+
     return jsonify({"success": True, "event": entry, "report": report}), 201
 
 
@@ -975,12 +1190,23 @@ def delete_report(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
+        denied = authorize_dashboard("delete_docket", existing)
+        if denied:
+            return denied
+
+        thread_id = existing.get("thread_id")
+        is_sup = bool(existing.get("is_supervisor"))
         supabase.table(REPORTS_TABLE).delete().eq("report_id", report_id).execute()
 
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    agent_session = active_agent_from_session()
+    by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+    send_to_thread(thread_id, "deleted", by, f"`{report_id}` permanently deleted",
+                   is_supervisor=is_sup)
 
     return jsonify({"success": True, "deleted": report_id}), 200
 
@@ -1018,6 +1244,7 @@ AGENT_REQUIRED_CREATE_FIELDS = ["discord_id"]
 AGENT_PATCHABLE_FIELDS = {
     "name",
     "status",
+    "agent_rank",
     "security_id",
     "agreement_id",
     "agent_id",
@@ -1057,6 +1284,7 @@ def create_agent():
             "discord_id": discord_id,
             "name": payload.get("name"),
             "status": payload.get("status", "onboarding"),
+            "agent_rank": payload.get("agent_rank", None),
             "security_id": None,
             "agreement_id": None,
             "agent_id": None,
