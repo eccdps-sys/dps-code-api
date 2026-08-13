@@ -51,6 +51,15 @@ SUPERVISOR_RANKS = {
     "Head Investigator",
     "Lead Agent",
     "Director",
+    "Department Director",
+}
+
+# Ranks that are permitted to reassign cases.
+REASSIGN_RANKS = {
+    "Head Investigator",
+    "Lead Agent",
+    "Director",
+    "Department Director",
 }
 
 # =====================================================================
@@ -139,7 +148,7 @@ CLEARANCE_POLICY = {
     "add_case_note": 1,
     "add_evidence": 1,
     "manage_dockets": 2,
-    "reassign_docket": 3,
+    "reassign_docket": 4,
     "decide_appeal": 4,
     "manage_agents": 5,
     "delete_docket": 5,
@@ -188,11 +197,35 @@ def has_supervisor_access(agent_row):
     return rank in SUPERVISOR_RANKS
 
 
+def has_reassign_access(agent_row):
+    """Return True if the agent's rank permits reassigning cases (Head Investigator+)."""
+    rank = str(agent_row.get("agent_rank") or "").strip()
+    return rank in REASSIGN_RANKS
+
+
+def is_assigned_agent(agent_row, report_row):
+    """Return True if agent_row is the agent assigned to report_row, or if they
+    have supervisor-rank access (they can act on any case)."""
+    if has_supervisor_access(agent_row):
+        return True
+    assigned = str(report_row.get("assigned_agent") or "").strip().lower()
+    if not assigned or assigned == "unassigned":
+        return False
+    candidates = [
+        str(agent_row.get("name") or "").strip().lower(),
+        str(agent_row.get("agent_id") or "").strip().lower(),
+        str(agent_row.get("discord_id") or "").strip().lower(),
+    ]
+    return any(c and (c == assigned or assigned.startswith(c)) for c in candidates)
+
+
 def authorize_dashboard(permission, report_row=None):
     """Permit BotGhost's API key or an active, cleared browser session.
 
     If report_row is supplied and is a supervisor report, also enforces
     that the agent holds a supervisor-eligible rank.
+
+    For reassign_docket, also enforces Head Investigator+ rank.
     """
     if verify_api_key():
         return None
@@ -202,6 +235,8 @@ def authorize_dashboard(permission, report_row=None):
         return error_response("Sign-in required", 401)
     if not has_permission(agent_row, permission):
         return error_response("Insufficient clearance", 403)
+    if permission == "reassign_docket" and not has_reassign_access(agent_row):
+        return error_response("Reassigning cases requires Head Investigator rank or above", 403)
     if report_row is not None and report_row.get("is_supervisor"):
         if not has_supervisor_access(agent_row):
             return error_response("Supervisor reports require Senior Agent rank or above", 403)
@@ -911,6 +946,11 @@ def begin_investigation(report_id):
         if denied:
             return denied
 
+        # Only the assigned agent (or supervisor-rank) can begin an investigation
+        agent_session = active_agent_from_session()
+        if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
+            return error_response("Only the assigned agent can begin the investigation", 403)
+
         current_status = str(row.get("status") or "").strip().lower()
         if current_status == "under investigation":
             return error_response("Investigation is already in progress", 409)
@@ -963,6 +1003,11 @@ def end_investigation(report_id):
         denied = authorize_dashboard("manage_dockets", row)
         if denied:
             return denied
+
+        # Only the assigned agent (or supervisor-rank) can end an investigation
+        agent_session_end = active_agent_from_session()
+        if not verify_api_key() and agent_session_end and not is_assigned_agent(agent_session_end, row):
+            return error_response("Only the assigned agent can end the investigation", 403)
 
         current_status = str(row.get("status") or "").strip().lower()
         if current_status != "under investigation":
@@ -1084,6 +1129,26 @@ def update_report(report_id):
         if denied:
             return denied
 
+        # Assigned-agent-only gate for status and field updates (supervisor ranks bypass)
+        if not verify_api_key() and ("status" in payload or "assigned_agent" in payload):
+            agent_session_upd = active_agent_from_session()
+            if agent_session_upd and not is_assigned_agent(agent_session_upd, existing):
+                return error_response("Only the assigned agent can update this case", 403)
+
+        # Status gate: before investigation begins only Open/Pending are allowed
+        if not verify_api_key() and "status" in payload:
+            current_status = str(existing.get("status") or "").strip().lower()
+            new_status = str(payload["status"]).strip()
+            pre_investigation = current_status not in ("under investigation",)
+            # Also block if investigation was concluded (status = pending/closed/appealed after end)
+            allowed_pre = {"Open", "Pending"}
+            if pre_investigation and new_status not in allowed_pre:
+                return error_response(
+                    f"Status can only be set to Open or Pending before an investigation has begun. "
+                    f"Start the investigation first to unlock other statuses.",
+                    409,
+                )
+
         changed_fields = [
             field for field, value in payload.items() if existing.get(field) != value
         ]
@@ -1161,6 +1226,12 @@ def add_note(report_id):
         if denied:
             return denied
 
+        # Only the assigned agent (or supervisor-rank agents) can add notes
+        if not verify_api_key():
+            agent_session = active_agent_from_session()
+            if agent_session and not is_assigned_agent(agent_session, existing):
+                return error_response("Only the assigned agent can add notes to this case", 403)
+
         if not verify_api_key() and str(existing.get("status") or "").strip().lower() != "under investigation":
             return error_response("Investigation must be started before adding notes", 409)
 
@@ -1230,6 +1301,12 @@ def add_evidence(report_id):
         denied = authorize_dashboard("add_evidence", existing)
         if denied:
             return denied
+
+        # Only the assigned agent (or supervisor-rank agents) can add evidence
+        if not verify_api_key():
+            agent_session = active_agent_from_session()
+            if agent_session and not is_assigned_agent(agent_session, existing):
+                return error_response("Only the assigned agent can add evidence to this case", 403)
 
         if not verify_api_key() and str(existing.get("status") or "").strip().lower() != "under investigation":
             return error_response("Investigation must be started before adding evidence", 409)
@@ -1500,6 +1577,17 @@ def update_agent(discord_id):
         if level < 1 or level > 5:
             return error_response("Field 'clearance_level' must be between 1 and 5", 400)
         payload["clearance_level"] = level
+
+    VALID_RANKS = {
+        "Trial Agent", "Probationary Agent", "Agent", "Senior Agent",
+        "Head Investigator", "Lead Agent", "Director", "Department Director",
+    }
+    if "agent_rank" in payload and payload["agent_rank"] is not None:
+        if str(payload["agent_rank"]).strip() not in VALID_RANKS:
+            return error_response(
+                f"Invalid agent_rank. Must be one of: {', '.join(sorted(VALID_RANKS))}",
+                400,
+            )
 
     try:
         existing = db_get_agent_row(discord_id)
