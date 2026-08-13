@@ -63,15 +63,16 @@ SUPERVISOR_RANKS = {
 
 # Emoji prefix per action type — keeps messages scannable at a glance.
 _AUDIT_ICONS = {
-    "viewed":    "👁️",
-    "created":   "📋",
-    "note":      "📝",
-    "evidence":  "📎",
-    "status":    "🔄",
-    "reassign":  "👤",
-    "field":     "✏️",
-    "deleted":   "🗑️",
-    "timeline":  "📌",
+    "viewed":        "👁️",
+    "created":       "📋",
+    "note":          "📝",
+    "evidence":      "📎",
+    "status":        "🔄",
+    "reassign":      "👤",
+    "field":         "✏️",
+    "deleted":       "🗑️",
+    "timeline":      "📌",
+    "investigation": "🔍",
 }
 
 def _post_webhook(url: str, payload: dict):
@@ -272,7 +273,7 @@ PATCHABLE_FIELDS = {
     "reason",
     "status",
     "assigned_agent",
-    "is_supervisor"
+    "is_supervisor",
 }
 
 
@@ -834,6 +835,20 @@ def report_viewed(report_id):
 
     agent_session = active_agent_from_session()
     by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+
+    # Write to timeline
+    try:
+        now = _now_iso()
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": "Report viewed in dashboard",
+            "by": by,
+            "created_at": now,
+        }).execute()
+        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
+    except Exception as exc:
+        app.logger.warning("Could not write viewed timeline entry: %s", exc)
+
     send_to_thread(row.get("thread_id"), "viewed", by,
                    f"`{report_id}` opened in dashboard",
                    is_supervisor=bool(row.get("is_supervisor")))
@@ -860,6 +875,20 @@ def evidence_opened(report_id):
 
     agent_session = active_agent_from_session()
     by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+
+    # Write to timeline
+    try:
+        now = _now_iso()
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": f"Evidence opened: {description[:80]}{'…' if len(description) > 80 else ''}",
+            "by": by,
+            "created_at": now,
+        }).execute()
+        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
+    except Exception as exc:
+        app.logger.warning("Could not write evidence_opened timeline entry: %s", exc)
+
     send_to_thread(row.get("thread_id"), "viewed", by,
                    f"`{report_id}` evidence opened — {description[:60]}{'…' if len(description) > 60 else ''}",
                    is_supervisor=bool(row.get("is_supervisor")))
@@ -867,7 +896,108 @@ def evidence_opened(report_id):
     return jsonify({"success": True}), 200
 
 
-@app.route("/reports", methods=["GET"])
+@app.route("/reports/<report_id>/investigation/begin", methods=["POST"])
+def begin_investigation(report_id):
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = authorize_dashboard("manage_dockets", row)
+        if denied:
+            return denied
+
+        current_status = str(row.get("status") or "").strip().lower()
+        if current_status == "under investigation":
+            return error_response("Investigation is already in progress", 409)
+        if current_status in ("closed", "completed"):
+            return error_response("Cannot begin investigation on a closed case", 409)
+
+        agent_session = active_agent_from_session()
+        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+        now = _now_iso()
+
+        supabase.table(REPORTS_TABLE).update({
+            "status": "Under Investigation",
+            "updated_at": now,
+        }).eq("report_id", report_id).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": "Investigation begun",
+            "by": by,
+            "created_at": now,
+        }).execute()
+
+        report = fetch_full_report_or_raise(report_id)
+
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    send_to_thread(report.get("thread_id"), "investigation", by,
+                   f"`{report_id}` — investigation begun",
+                   is_supervisor=bool(report.get("is_supervisor")))
+
+    return jsonify({"success": True, "report": report}), 200
+
+
+@app.route("/reports/<report_id>/investigation/end", methods=["POST"])
+def end_investigation(report_id):
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = authorize_dashboard("manage_dockets", row)
+        if denied:
+            return denied
+
+        current_status = str(row.get("status") or "").strip().lower()
+        if current_status != "under investigation":
+            return error_response("No investigation is currently in progress", 409)
+
+        agent_session = active_agent_from_session()
+        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+        now = _now_iso()
+
+        supabase.table(REPORTS_TABLE).update({
+            "status": "Pending",
+            "updated_at": now,
+        }).eq("report_id", report_id).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": "Investigation concluded",
+            "by": by,
+            "created_at": now,
+        }).execute()
+
+        report = fetch_full_report_or_raise(report_id)
+
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    send_to_thread(report.get("thread_id"), "investigation", by,
+                   f"`{report_id}` — investigation concluded, status → Pending",
+                   is_supervisor=bool(report.get("is_supervisor")))
+
+    return jsonify({"success": True, "report": report}), 200
 def list_reports():
     """
     Optional convenience endpoint: list all reports, with optional
@@ -1028,6 +1158,9 @@ def add_note(report_id):
         if denied:
             return denied
 
+        if not verify_api_key() and str(existing.get("status") or "").strip().lower() != "under investigation":
+            return error_response("Investigation must be started before adding notes", 409)
+
         now = _now_iso()
         supabase.table(NOTES_TABLE).insert({
             "report_id": report_id,
@@ -1094,6 +1227,9 @@ def add_evidence(report_id):
         denied = authorize_dashboard("add_evidence", existing)
         if denied:
             return denied
+
+        if not verify_api_key() and str(existing.get("status") or "").strip().lower() != "under investigation":
+            return error_response("Investigation must be started before adding evidence", 409)
 
         now = _now_iso()
 
