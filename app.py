@@ -998,6 +998,9 @@ def end_investigation(report_id):
                    is_supervisor=bool(report.get("is_supervisor")))
 
     return jsonify({"success": True, "report": report}), 200
+
+
+@app.route("/reports", methods=["GET"])
 def list_reports():
     """
     Optional convenience endpoint: list all reports, with optional
