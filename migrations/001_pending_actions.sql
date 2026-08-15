@@ -2,6 +2,15 @@
 -- Run once in the Supabase SQL editor.
 -- Queue of Discord-side report actions for the bot to pick up.
 
+-- Ensure reports.report_id has an explicit unique constraint (some Supabase
+-- versions only create a unique index from the column-level UNIQUE keyword,
+-- which foreign keys don't accept as a matching key).
+DO $$ BEGIN
+    ALTER TABLE reports ADD CONSTRAINT reports_report_id_key UNIQUE (report_id);
+EXCEPTION
+    WHEN duplicate_object THEN NULL;  -- constraint already exists, skip
+END $$;
+
 create table if not exists public.pending_actions (
     id            bigint generated always as identity primary key,
     report_id     text        not null references public.reports (report_id) on delete cascade,
