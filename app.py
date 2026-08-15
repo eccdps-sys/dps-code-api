@@ -1,4 +1,4 @@
-from flask import g, jsonify, redirect, request, session
+from flask import Flask, g, jsonify, redirect, request, session
 import random
 import string
 import os
