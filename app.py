@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, redirect, request, session
+from flask import g, jsonify, redirect, request, session
 import random
 import string
 import os
@@ -82,6 +82,10 @@ _AUDIT_ICONS = {
     "deleted":       "🗑️",
     "timeline":      "📌",
     "investigation": "🔍",
+    "validate":      "✅",
+    "invalidate":    "❌",
+    "contact":       "📨",
+    "bot":           "🤖",
 }
 
 def _post_webhook(url: str, payload: dict):
@@ -156,8 +160,11 @@ CLEARANCE_POLICY = {
 
 
 def verify_api_key():
-    auth = request.headers.get("Authorization")
-    return bool(API_KEY) and bool(auth) and secrets.compare_digest(auth, API_KEY)
+    # Cached per-request: several routes check this more than once.
+    if "api_key_ok" not in g:
+        auth = request.headers.get("Authorization")
+        g.api_key_ok = bool(API_KEY) and bool(auth) and secrets.compare_digest(auth, API_KEY)
+    return g.api_key_ok
 
 
 def oauth_configured():
@@ -171,15 +178,22 @@ def oauth_configured():
 
 
 def active_agent_from_session():
-    """Return the live agent row for this browser session, if eligible."""
+    """Return the live agent row for this browser session, if eligible.
+    Cached per-request so repeated calls cost at most one Supabase read."""
+    if "dashboard_agent_row" in g:
+        return g.dashboard_agent_row
+
     discord_id = session.get("discord_id")
     if not discord_id:
+        g.dashboard_agent_row = None
         return None
 
     row = db_get_agent_row(str(discord_id))
     if not row or str(row.get("status") or "").strip().lower() != "active":
         session.clear()
+        g.dashboard_agent_row = None
         return None
+    g.dashboard_agent_row = row
     return row
 
 
@@ -219,13 +233,14 @@ def is_assigned_agent(agent_row, report_row):
     return any(c and (c == assigned or assigned.startswith(c)) for c in candidates)
 
 
-def authorize_dashboard(permission, report_row=None):
+def authorize_dashboard(permission):
     """Permit BotGhost's API key or an active, cleared browser session.
 
-    If report_row is supplied and is a supervisor report, also enforces
-    that the agent holds a supervisor-eligible rank.
+    Checks sign-in, clearance level, and — for reassign_docket — that the
+    agent holds Head Investigator rank or above.
 
-    For reassign_docket, also enforces Head Investigator+ rank.
+    Routes that act on a specific report additionally call
+    supervisor_report_denied() once the row has been fetched.
     """
     if verify_api_key():
         return None
@@ -237,10 +252,17 @@ def authorize_dashboard(permission, report_row=None):
         return error_response("Insufficient clearance", 403)
     if permission == "reassign_docket" and not has_reassign_access(agent_row):
         return error_response("Reassigning cases requires Head Investigator rank or above", 403)
-    if report_row is not None and report_row.get("is_supervisor"):
-        if not has_supervisor_access(agent_row):
-            return error_response("Supervisor reports require Senior Agent rank or above", 403)
     return None
+
+
+def supervisor_report_denied(report_row):
+    """Row-level gate for supervisor reports. Call after authorize_dashboard()
+    has already validated sign-in and clearance for the request."""
+    if report_row is None or not report_row.get("is_supervisor"):
+        return None
+    if verify_api_key() or has_supervisor_access(active_agent_from_session() or {}):
+        return None
+    return error_response("Supervisor reports require Senior Agent rank or above", 403)
 
 
 @app.after_request
@@ -295,6 +317,23 @@ NOTES_TABLE = "notes"
 EVIDENCE_TABLE = "evidence"
 TIMELINE_TABLE = "timeline"
 AGENTS_TABLE = "agents"
+PENDING_ACTIONS_TABLE = "pending_actions"
+
+# Report actions that require the Discord bot to do follow-up work (DM the
+# reporter, adjust roles, post logs). Each one is queued for the bot after
+# the API has applied its own state change, so Supabase stays the single
+# source of truth and races between Discord and the dashboard resolve to a
+# 409 for whichever side loses.
+# Action -> (required current status, new status). None means no state change.
+REPORT_ACTIONS = {
+    "validate":         ("under investigation", "Validated"),
+    "invalidate":       ("under investigation", "Invalidated"),
+    "investigate":      ("__pre__", "Under Investigation"),
+    "contact_reporter": (None, None),
+}
+
+# Statuses an investigation can start from.
+_PRE_INVESTIGATION = ("open", "pending")
 
 REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reported", "reason"]
 
@@ -842,7 +881,7 @@ def get_report(report_id):
         row = db_get_report_row(report_id)
         if row is None:
             return error_response(f"Report '{report_id}' not found", 404)
-        denied = authorize_dashboard("view_dashboard", row)
+        denied = supervisor_report_denied(row)
         if denied:
             return denied
         report = build_report_json(row)
@@ -864,7 +903,7 @@ def report_viewed(report_id):
     if row is None:
         return error_response(f"Report '{report_id}' not found", 404)
 
-    denied = authorize_dashboard("view_dashboard", row)
+    denied = supervisor_report_denied(row)
     if denied:
         return denied
 
@@ -901,7 +940,7 @@ def evidence_opened(report_id):
     if row is None:
         return error_response(f"Report '{report_id}' not found", 404)
 
-    denied = authorize_dashboard("view_dashboard", row)
+    denied = supervisor_report_denied(row)
     if denied:
         return denied
 
@@ -942,7 +981,7 @@ def begin_investigation(report_id):
         if row is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        denied = authorize_dashboard("manage_dockets", row)
+        denied = supervisor_report_denied(row)
         if denied:
             return denied
 
@@ -1000,7 +1039,7 @@ def end_investigation(report_id):
         if row is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        denied = authorize_dashboard("manage_dockets", row)
+        denied = supervisor_report_denied(row)
         if denied:
             return denied
 
@@ -1125,7 +1164,7 @@ def update_report(report_id):
             return error_response(f"Report '{report_id}' not found", 404)
 
         # Supervisor report rank check
-        denied = authorize_dashboard(permission, existing)
+        denied = supervisor_report_denied(existing)
         if denied:
             return denied
 
@@ -1222,7 +1261,7 @@ def add_note(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        denied = authorize_dashboard("add_case_note", existing)
+        denied = supervisor_report_denied(existing)
         if denied:
             return denied
 
@@ -1298,7 +1337,7 @@ def add_evidence(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        denied = authorize_dashboard("add_evidence", existing)
+        denied = supervisor_report_denied(existing)
         if denied:
             return denied
 
@@ -1377,7 +1416,7 @@ def add_timeline_event(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        denied = authorize_dashboard("manage_dockets", existing)
+        denied = supervisor_report_denied(existing)
         if denied:
             return denied
 
@@ -1426,7 +1465,7 @@ def delete_report(report_id):
         if existing is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        denied = authorize_dashboard("delete_docket", existing)
+        denied = supervisor_report_denied(existing)
         if denied:
             return denied
 
@@ -1445,6 +1484,226 @@ def delete_report(report_id):
                    is_supervisor=is_sup)
 
     return jsonify({"success": True, "deleted": report_id}), 200
+
+
+# =====================================================================
+# REPORT ACTIONS (validate / invalidate / contact reporter / investigate)
+# =====================================================================
+# The dashboard exposes the same action buttons as the Discord embed. The
+# API applies the state change itself and queues a pending_actions row; the
+# Discord bot polls GET /actions/pending on a timer, performs the parts only
+# it can do (DMs, role changes, logs), and closes the row via
+# POST /actions/<id>/complete.
+#
+# Because the state transition is guarded here, a Discord button click and a
+# dashboard click racing each other resolve cleanly: the first one wins and
+# the second gets a 409.
+
+@app.route("/reports/<report_id>/action", methods=["POST"])
+def report_action(report_id):
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response("Request body must be valid JSON", 400)
+
+    action = str(payload.get("action", "")).strip().lower()
+    if action not in REPORT_ACTIONS:
+        return error_response(
+            f"Unknown action '{action}'. Must be one of: {', '.join(sorted(REPORT_ACTIONS))}",
+            400,
+        )
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = supervisor_report_denied(row)
+        if denied:
+            return denied
+
+        # Same actor rules as investigation begin/end: the assigned agent or
+        # a supervisor-rank agent (bot API key bypasses).
+        agent_session = active_agent_from_session()
+        if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
+            return error_response("Only the assigned agent can action this case", 403)
+
+        current_status = str(row.get("status") or "").strip().lower()
+        required_status, new_status = REPORT_ACTIONS[action]
+
+        # Guard the transition so a duplicate/racing request loses with a 409
+        # instead of producing a second result.
+        if required_status == "__pre__":
+            if current_status == "under investigation":
+                return error_response("Investigation is already in progress", 409)
+            if current_status in ("closed", "completed"):
+                return error_response("Cannot begin investigation on a closed case", 409)
+        elif required_status is not None:
+            if current_status != required_status:
+                return error_response(
+                    f"'{action}' requires the case to be "
+                    f"'{required_status.title()}', but it is currently "
+                    f"'{row.get('status') or 'Unknown'}'",
+                    409,
+                )
+
+        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+        now = _now_iso()
+
+        if new_status is not None:
+            supabase.table(REPORTS_TABLE).update({
+                "status": new_status,
+                "updated_at": now,
+            }).eq("report_id", report_id).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": {
+                "investigate": "Investigation begun",
+                "validate": "Report validated",
+                "invalidate": "Report invalidated",
+                "contact_reporter": "Reporter contact requested",
+            }[action],
+            "by": by,
+            "created_at": now,
+        }).execute()
+
+        # Queue the Discord-side work (DM / roles / logging) for the bot.
+        queue_resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .insert({
+                "report_id": report_id,
+                "action": action,
+                "requested_by": by,
+                "status": "pending",
+                "created_at": now,
+            })
+            .execute()
+        )
+
+        report = fetch_full_report_or_raise(report_id)
+
+    except ReportNotFound:
+        return error_response(f"Report '{report_id}' not found", 404)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    send_to_thread(report.get("thread_id"), action, by,
+                   f"`{report_id}` — {action.replace('_', ' ')} requested; bot will follow up",
+                   is_supervisor=bool(report.get("is_supervisor")))
+
+    return jsonify({
+        "success": True,
+        "action": action,
+        "queued": True,
+        "report": report,
+    }), 200
+
+
+@app.route("/actions/pending", methods=["GET"])
+def list_pending_actions():
+    """
+    Bot-facing queue. Returns pending actions joined with the report basics
+    the bot needs to act (thread_id, reporter, reported, reason).
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    try:
+        resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(50)
+            .execute()
+        )
+        rows = resp.data or []
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    actions = [
+        {
+            "id": r["id"],
+            "report_id": r.get("report_id"),
+            "action": r.get("action"),
+            "requested_by": r.get("requested_by"),
+            "created_at": r.get("created_at"),
+            "report": r.get("reports"),
+        }
+        for r in rows
+    ]
+    return jsonify({"success": True, "count": len(actions), "actions": actions}), 200
+
+
+@app.route("/actions/<int:action_id>/complete", methods=["POST"])
+def complete_action(action_id):
+    """
+    Bot closes out a queued action. Body: {"result": "success"|"failed",
+    "note": optional one-liner about what was done (DM sent, roles changed)}.
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response("Request body must be valid JSON", 400)
+
+    result = str(payload.get("result", "success")).strip().lower()
+    if result not in ("success", "failed"):
+        return error_response("Field 'result' must be 'success' or 'failed'", 400)
+    note = str(payload.get("note", "")).strip()
+
+    try:
+        resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .select("*")
+            .eq("id", action_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return error_response(f"Action '{action_id}' not found", 404)
+        row = rows[0]
+
+        if row.get("status") != "pending":
+            return error_response(
+                f"Action '{action_id}' is already '{row.get('status')}'", 409
+            )
+
+        now = _now_iso()
+        supabase.table(PENDING_ACTIONS_TABLE).update({
+            "status": result,
+            "result_note": note or None,
+            "completed_at": now,
+        }).eq("id", action_id).execute()
+
+        # Audit the bot's completion into the thread so both surfaces see it.
+        report_row = db_get_report_row(row.get("report_id"))
+        if report_row:
+            summary = note or f"{row.get('action')} finished ({result})"
+            send_to_thread(
+                report_row.get("thread_id"),
+                "bot",
+                "DPS Bot",
+                f"`{row['report_id']}` — {summary}",
+                is_supervisor=bool(report_row.get("is_supervisor")),
+            )
+
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({"success": True, "completed": action_id, "result": result}), 200
 
 
 # =====================================================================
