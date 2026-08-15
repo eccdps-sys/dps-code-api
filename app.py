@@ -1643,6 +1643,50 @@ def list_pending_actions():
     return jsonify({"success": True, "count": len(actions), "actions": actions}), 200
 
 
+@app.route("/actions/next", methods=["GET"])
+def next_pending_action():
+    """
+    Bot-friendly single-action pickup. Claims the oldest pending action by
+    atomically flipping it to 'processing', so two bot ticks never grab
+    the same action. Returns 204 with no body when there is nothing to do
+    (easy for BotGhost to check: response body empty = go back to sleep).
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    try:
+        resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return "", 204
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    row = rows[0]
+    now = _now_iso()
+    supabase.table(PENDING_ACTIONS_TABLE).update({
+        "status": "processing",
+    }).eq("id", row["id"]).execute()
+
+    return jsonify({
+        "success": True,
+        "id": row["id"],
+        "report_id": row.get("report_id"),
+        "action": row.get("action"),
+        "requested_by": row.get("requested_by"),
+        "report": row.get("reports"),
+    }), 200
+
+
 @app.route("/actions/<int:action_id>/complete", methods=["POST"])
 def complete_action(action_id):
     """
