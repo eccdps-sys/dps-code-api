@@ -1579,6 +1579,19 @@ def report_action(report_id):
             "created_at": now,
         }).execute()
 
+        # For contact_reporter: write the opening agent message into
+        # contact_messages so the dashboard thread card shows message 1/5
+        # immediately and unlocks the reply box.
+        if action == "contact_reporter":
+            opening_body = reason or "An agent has reached out regarding your report and will be in contact shortly."
+            supabase.table(CONTACT_MESSAGES_TABLE).insert({
+                "report_id": report_id,
+                "sender": "agent",
+                "sender_name": by,
+                "body": opening_body,
+                "created_at": now,
+            }).execute()
+
         # Queue the Discord-side work (DM / roles / logging) for the bot.
         queue_resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
