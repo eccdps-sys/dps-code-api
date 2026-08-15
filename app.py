@@ -318,6 +318,10 @@ EVIDENCE_TABLE = "evidence"
 TIMELINE_TABLE = "timeline"
 AGENTS_TABLE = "agents"
 PENDING_ACTIONS_TABLE = "pending_actions"
+CONTACT_MESSAGES_TABLE = "contact_messages"
+
+# Maximum number of messages allowed in a contact_reporter conversation.
+CONTACT_MAX_MESSAGES = 5
 
 # Report actions that require the Discord bot to do follow-up work (DM the
 # reporter, adjust roles, post logs). Each one is queued for the bot after
@@ -1516,6 +1520,10 @@ def report_action(report_id):
             400,
         )
 
+    # Optional human-readable reason the agent supplied (e.g. why they're
+    # invalidating, or what to investigate). Stored in timeline + queue row.
+    reason = str(payload.get("reason", "")).strip() or None
+
     try:
         row = db_get_report_row(report_id)
         if row is None:
@@ -1566,7 +1574,7 @@ def report_action(report_id):
                 "validate": "Report validated",
                 "invalidate": "Report invalidated",
                 "contact_reporter": "Reporter contact requested",
-            }[action],
+            }[action] + (f" — {reason}" if reason else ""),
             "by": by,
             "created_at": now,
         }).execute()
@@ -1578,6 +1586,7 @@ def report_action(report_id):
                 "report_id": report_id,
                 "action": action,
                 "requested_by": by,
+                "reason": reason,
                 "status": "pending",
                 "created_at": now,
             })
@@ -1594,7 +1603,8 @@ def report_action(report_id):
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
     send_to_thread(report.get("thread_id"), action, by,
-                   f"`{report_id}` — {action.replace('_', ' ')} requested; bot will follow up",
+                   f"`{report_id}` — {action.replace('_', ' ')} requested"
+                   + (f": {reason}" if reason else "; bot will follow up"),
                    is_supervisor=bool(report.get("is_supervisor")))
 
     return jsonify({
@@ -1683,6 +1693,7 @@ def next_pending_action():
         "report_id": row.get("report_id"),
         "action": row.get("action"),
         "requested_by": row.get("requested_by"),
+        "reason": row.get("reason"),
         "report": row.get("reports"),
     }), 200
 
@@ -1748,6 +1759,235 @@ def complete_action(action_id):
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "completed": action_id, "result": result}), 200
+
+
+# =====================================================================
+# CONTACT REPORTER CONVERSATION
+# =====================================================================
+# A capped (5-message) back-and-forth between the assigned agent and the
+# reporter, relayed through the Discord bot via DMs.
+#
+# Flow:
+#   1. Agent presses "Contact Reporter" → POST /reports/:id/action with
+#      action=contact_reporter (queues bot DM to reporter, inserts first
+#      message with sender="agent").
+#   2. Reporter DMs the bot back → bot calls POST /reports/:id/contact/respond
+#      with {"body": "...", "sender_name": "ReporterName"}.
+#   3. Agent replies from the dashboard → POST /reports/:id/contact/reply
+#      with {"body": "..."} → queues another bot DM to reporter.
+#   4. Repeat up to CONTACT_MAX_MESSAGES total (combined).
+#
+# GET /reports/:id/contact returns the full thread so the dashboard can
+# show the conversation card.
+# =====================================================================
+
+def db_get_contact_messages(report_id):
+    resp = (
+        supabase.table(CONTACT_MESSAGES_TABLE)
+        .select("*")
+        .eq("report_id", report_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return resp.data or []
+
+
+def serialize_contact_message(row):
+    return {
+        "id": row.get("id"),
+        "sender": row.get("sender"),
+        "sender_name": row.get("sender_name"),
+        "body": row.get("body"),
+        "timestamp": row.get("created_at"),
+    }
+
+
+@app.route("/reports/<report_id>/contact", methods=["GET"])
+def get_contact_thread(report_id):
+    """Return the contact_reporter conversation for this report."""
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = supervisor_report_denied(row)
+        if denied:
+            return denied
+
+        messages = db_get_contact_messages(report_id)
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({
+        "success": True,
+        "report_id": report_id,
+        "message_count": len(messages),
+        "max_messages": CONTACT_MAX_MESSAGES,
+        "messages": [serialize_contact_message(m) for m in messages],
+    }), 200
+
+
+@app.route("/reports/<report_id>/contact/reply", methods=["POST"])
+def contact_reply(report_id):
+    """
+    Dashboard agent sends a follow-up message to the reporter.
+    Inserts a contact_message row (sender='agent') and queues a bot DM.
+    Blocked once the conversation reaches CONTACT_MAX_MESSAGES.
+    """
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response("Request body must be valid JSON", 400)
+
+    body = str(payload.get("body", "")).strip()
+    if not body:
+        return error_response("Field 'body' is required", 400)
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = supervisor_report_denied(row)
+        if denied:
+            return denied
+
+        agent_session = active_agent_from_session()
+        if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
+            return error_response("Only the assigned agent can contact the reporter", 403)
+
+        messages = db_get_contact_messages(report_id)
+        if len(messages) >= CONTACT_MAX_MESSAGES:
+            return error_response(
+                f"This conversation has reached the {CONTACT_MAX_MESSAGES}-message limit", 409
+            )
+
+        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "DPS Agent"
+        now = _now_iso()
+
+        supabase.table(CONTACT_MESSAGES_TABLE).insert({
+            "report_id": report_id,
+            "sender": "agent",
+            "sender_name": by,
+            "body": body,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": f"Agent message sent to reporter ({len(messages) + 1}/{CONTACT_MAX_MESSAGES})",
+            "by": by,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
+
+        # Queue a bot DM to the reporter.
+        remaining = CONTACT_MAX_MESSAGES - (len(messages) + 1)
+        supabase.table(PENDING_ACTIONS_TABLE).insert({
+            "report_id": report_id,
+            "action": "contact_reporter",
+            "requested_by": by,
+            "reason": body,
+            "status": "pending",
+            "created_at": now,
+        }).execute()
+
+        messages = db_get_contact_messages(report_id)
+
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    send_to_thread(row.get("thread_id"), "contact", by,
+                   f"`{report_id}` — agent replied to reporter ({len(messages)}/{CONTACT_MAX_MESSAGES} messages)",
+                   is_supervisor=bool(row.get("is_supervisor")))
+
+    return jsonify({
+        "success": True,
+        "message_count": len(messages),
+        "max_messages": CONTACT_MAX_MESSAGES,
+        "messages": [serialize_contact_message(m) for m in messages],
+    }), 201
+
+
+@app.route("/reports/<report_id>/contact/respond", methods=["POST"])
+def contact_respond(report_id):
+    """
+    Bot relays the reporter's DM reply back into the conversation.
+    Called by BotGhost when the reporter DMs the bot in response.
+    Body: {"body": "...", "sender_name": "DiscordUsername"}
+    Bot API key required.
+    """
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response("Request body must be valid JSON", 400)
+
+    body = str(payload.get("body", "")).strip()
+    sender_name = str(payload.get("sender_name", "Reporter")).strip() or "Reporter"
+    if not body:
+        return error_response("Field 'body' is required", 400)
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        messages = db_get_contact_messages(report_id)
+        if len(messages) >= CONTACT_MAX_MESSAGES:
+            return error_response(
+                f"This conversation has reached the {CONTACT_MAX_MESSAGES}-message limit", 409
+            )
+
+        now = _now_iso()
+
+        supabase.table(CONTACT_MESSAGES_TABLE).insert({
+            "report_id": report_id,
+            "sender": "reporter",
+            "sender_name": sender_name,
+            "body": body,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": f"Reporter replied ({len(messages) + 1}/{CONTACT_MAX_MESSAGES})",
+            "by": sender_name,
+            "created_at": now,
+        }).execute()
+
+        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
+
+        messages = db_get_contact_messages(report_id)
+
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    send_to_thread(row.get("thread_id"), "contact", sender_name,
+                   f"`{report_id}` — reporter replied ({len(messages)}/{CONTACT_MAX_MESSAGES} messages)",
+                   is_supervisor=bool(row.get("is_supervisor")))
+
+    return jsonify({
+        "success": True,
+        "message_count": len(messages),
+        "max_messages": CONTACT_MAX_MESSAGES,
+        "messages": [serialize_contact_message(m) for m in messages],
+    }), 201
 
 
 # =====================================================================
