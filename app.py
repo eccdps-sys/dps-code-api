@@ -334,6 +334,7 @@ REPORT_ACTIONS = {
     "invalidate":       ("under investigation", "Invalidated"),
     "investigate":      ("__pre__", "Under Investigation"),
     "contact_reporter": (None, None),
+    "claim":            ("open", None),
 }
 
 # Statuses an investigation can start from.
@@ -1547,8 +1548,11 @@ def report_action(report_id):
         if required_status == "__pre__":
             if current_status == "under investigation":
                 return error_response("Investigation is already in progress", 409)
-            if current_status in ("closed", "completed"):
-                return error_response("Cannot begin investigation on a closed case", 409)
+            # Allow reopen only if caller has clearance >= 4
+            if current_status in ("closed", "completed", "validated", "invalidated"):
+                caller_clearance = int((agent_session or {}).get("clearance_level") or 0)
+                if caller_clearance < 4:
+                    return error_response("Cannot reopen a concluded investigation without clearance level 4", 403)
         elif required_status is not None:
             if current_status != required_status:
                 return error_response(
@@ -1561,6 +1565,16 @@ def report_action(report_id):
         by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
         now = _now_iso()
 
+        # Handle claim action: assign the claiming agent to the case
+        if action == "claim":
+            # Get the agent's Discord ID for assignment
+            agent_discord_id = (agent_session or {}).get("discord_id")
+            if agent_discord_id:
+                supabase.table(REPORTS_TABLE).update({
+                    "assigned_agent": agent_discord_id,
+                    "updated_at": now,
+                }).eq("report_id", report_id).execute()
+
         if new_status is not None:
             supabase.table(REPORTS_TABLE).update({
                 "status": new_status,
@@ -1570,10 +1584,11 @@ def report_action(report_id):
         supabase.table(TIMELINE_TABLE).insert({
             "report_id": report_id,
             "event": {
-                "investigate": "Investigation begun",
+                "investigate": "Investigation reopened" if current_status in ("closed", "completed", "validated", "invalidated") else "Investigation begun",
                 "validate": "Report validated",
                 "invalidate": "Report invalidated",
                 "contact_reporter": "Reporter contact requested",
+                "claim": "Case claimed by agent",
             }[action] + (f" — {reason}" if reason else ""),
             "by": by,
             "created_at": now,
