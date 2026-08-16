@@ -5,7 +5,7 @@ import os
 import json
 import secrets
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -914,17 +914,33 @@ def report_viewed(report_id):
 
     agent_session = active_agent_from_session()
     by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+    agent_id = (agent_session or {}).get("agent_id") or (agent_session or {}).get("discord_id") or by
 
-    # Write to timeline
+    # Deduplicate: only log a "viewed" event if this agent hasn't viewed
+    # this report in the last 30 minutes. This prevents spamming the timeline
+    # on every page load and avoids the updated_at race condition.
     try:
         now = _now_iso()
-        supabase.table(TIMELINE_TABLE).insert({
-            "report_id": report_id,
-            "event": "Report viewed in dashboard",
-            "by": by,
-            "created_at": now,
-        }).execute()
-        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        recent = (
+            supabase.table(TIMELINE_TABLE)
+            .select("id")
+            .eq("report_id", report_id)
+            .eq("event", "Report viewed in dashboard")
+            .eq("by", by)
+            .gte("created_at", cutoff)
+            .limit(1)
+            .execute()
+        )
+        if not recent.data:
+            supabase.table(TIMELINE_TABLE).insert({
+                "report_id": report_id,
+                "event": "Report viewed in dashboard",
+                "by": by,
+                "created_at": now,
+            }).execute()
+            # Only bump updated_at when we actually write an event
+            supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
     except Exception as exc:
         app.logger.warning("Could not write viewed timeline entry: %s", exc)
 
@@ -1206,10 +1222,25 @@ def update_report(report_id):
                 "report_id", report_id
             ).execute()
 
+            # Build a human-readable timeline event based on what changed
+            if changed_fields == ["assigned_agent"]:
+                new_assignee = payload.get("assigned_agent") or "Unassigned"
+                tl_event = "Assigned agent updated"
+                tl_detail = f"Case assigned to: {new_assignee}"
+                tl_by = (active_agent_from_session() or {}).get("name") or new_assignee or "System"
+            elif changed_fields == ["status"]:
+                tl_event = "Status updated"
+                tl_detail = f"Status changed to: {payload.get('status', 'Unknown')}"
+                tl_by = (active_agent_from_session() or {}).get("name") or "System"
+            else:
+                tl_event = "Case updated"
+                tl_detail = f"Updated: {', '.join(changed_fields)}"
+                tl_by = (active_agent_from_session() or {}).get("name") or "System"
+
             supabase.table(TIMELINE_TABLE).insert({
                 "report_id": report_id,
-                "event": f"Updated field(s): {', '.join(changed_fields)}",
-                "by": payload.get("assigned_agent") or "System",
+                "event": f"{tl_event}\n{tl_detail}",
+                "by": tl_by,
                 "created_at": now,
             }).execute()
 
@@ -1289,7 +1320,7 @@ def add_note(report_id):
 
         supabase.table(TIMELINE_TABLE).insert({
             "report_id": report_id,
-            "event": f"Note added by {author}",
+            "event": f"Note added\n{note_text[:300]}",
             "by": author,
             "created_at": now,
         }).execute()
@@ -1367,7 +1398,7 @@ def add_evidence(report_id):
 
         supabase.table(TIMELINE_TABLE).insert({
             "report_id": report_id,
-            "event": f"Evidence added by {submitted_by}",
+            "event": f"Evidence attached\n{description[:150]} — {url[:200]}",
             "by": submitted_by,
             "created_at": now,
         }).execute()
@@ -1787,6 +1818,122 @@ def complete_action(action_id):
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
     return jsonify({"success": True, "completed": action_id, "result": result}), 200
+
+
+# =====================================================================
+# SPLIT QUEUES — supervisor vs operator
+# =====================================================================
+# Two dedicated single-action pickup endpoints so BotGhost can run two
+# separate read-event triggers: one for supervisor cases and one for
+# operator cases. Each works identically to /actions/next but filters
+# on the linked report's is_supervisor flag.
+
+def _next_action_for_queue(is_supervisor: bool):
+    """Shared logic for the supervisor/operator queue pickup endpoints."""
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+
+    try:
+        resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(50)
+            .execute()
+        )
+        rows = resp.data or []
+        # Filter by is_supervisor on the joined report row
+        rows = [
+            r for r in rows
+            if bool((r.get("reports") or {}).get("is_supervisor")) == is_supervisor
+        ]
+        if not rows:
+            return "", 204
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    row = rows[0]
+    now = _now_iso()
+    supabase.table(PENDING_ACTIONS_TABLE).update({
+        "status": "processing",
+    }).eq("id", row["id"]).execute()
+
+    return jsonify({
+        "success": True,
+        "id": row["id"],
+        "report_id": row.get("report_id"),
+        "action": row.get("action"),
+        "requested_by": row.get("requested_by"),
+        "reason": row.get("reason"),
+        "report": row.get("reports"),
+    }), 200
+
+
+@app.route("/actions/next/operator", methods=["GET"])
+def next_operator_action():
+    """
+    Single-action pickup for the operator queue (non-supervisor reports only).
+    BotGhost read-event trigger #1. Returns 204 when queue is empty.
+    """
+    return _next_action_for_queue(is_supervisor=False)
+
+
+@app.route("/actions/next/supervisor", methods=["GET"])
+def next_supervisor_action():
+    """
+    Single-action pickup for the supervisor queue (supervisor reports only).
+    BotGhost read-event trigger #2. Returns 204 when queue is empty.
+    """
+    return _next_action_for_queue(is_supervisor=True)
+
+
+@app.route("/actions/pending/operator", methods=["GET"])
+def list_operator_actions():
+    """List all pending operator (non-supervisor) actions. Bot-facing."""
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+    try:
+        resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(50)
+            .execute()
+        )
+        rows = [r for r in (resp.data or []) if not bool((r.get("reports") or {}).get("is_supervisor"))]
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+    actions = [{"id": r["id"], "report_id": r.get("report_id"), "action": r.get("action"),
+                "requested_by": r.get("requested_by"), "created_at": r.get("created_at"),
+                "report": r.get("reports")} for r in rows]
+    return jsonify({"success": True, "count": len(actions), "actions": actions}), 200
+
+
+@app.route("/actions/pending/supervisor", methods=["GET"])
+def list_supervisor_actions():
+    """List all pending supervisor actions. Bot-facing."""
+    if not verify_api_key():
+        return error_response("Unauthorized", 401)
+    try:
+        resp = (
+            supabase.table(PENDING_ACTIONS_TABLE)
+            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(50)
+            .execute()
+        )
+        rows = [r for r in (resp.data or []) if bool((r.get("reports") or {}).get("is_supervisor"))]
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+    actions = [{"id": r["id"], "report_id": r.get("report_id"), "action": r.get("action"),
+                "requested_by": r.get("requested_by"), "created_at": r.get("created_at"),
+                "report": r.get("reports")} for r in rows]
+    return jsonify({"success": True, "count": len(actions), "actions": actions}), 200
 
 
 # =====================================================================
