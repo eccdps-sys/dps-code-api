@@ -1892,8 +1892,9 @@ def next_supervisor_action():
 
 @app.route("/actions/pending/operator", methods=["GET"])
 def list_operator_actions():
-    """List all pending operator (non-supervisor) actions. Bot-facing."""
-    if not verify_api_key():
+    """List all pending operator (non-supervisor) actions. Dashboard + bot-facing."""
+    denied = authorize_dashboard("view_dashboard")
+    if denied and not verify_api_key():
         return error_response("Unauthorized", 401)
     try:
         resp = (
@@ -1915,8 +1916,9 @@ def list_operator_actions():
 
 @app.route("/actions/pending/supervisor", methods=["GET"])
 def list_supervisor_actions():
-    """List all pending supervisor actions. Bot-facing."""
-    if not verify_api_key():
+    """List all pending supervisor actions. Dashboard + bot-facing."""
+    denied = authorize_dashboard("view_dashboard")
+    if denied and not verify_api_key():
         return error_response("Unauthorized", 401)
     try:
         resp = (
