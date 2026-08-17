@@ -447,6 +447,7 @@ def serialize_note(row):
 
 def serialize_evidence(row):
     return {
+        "report_id": row.get("report_id"),
         "description": row.get("description"),
         "url": row.get("url"),
         "submitted_by": row.get("submitted_by"),
@@ -1025,6 +1026,27 @@ def report_viewed(report_id):
                    is_supervisor=bool(row.get("is_supervisor")))
 
     return jsonify({"success": True}), 200
+
+
+@app.route("/evidence", methods=["GET"])
+def list_all_evidence():
+    """Return all rows from public.evidence, newest first. Used by the Evidence page."""
+    denied = authorize_dashboard("view_dashboard")
+    if denied:
+        return denied
+    try:
+        resp = (
+            supabase.table(EVIDENCE_TABLE)
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        rows = resp.data or []
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+    return jsonify({"success": True, "count": len(rows), "evidence": [serialize_evidence(r) for r in rows]}), 200
 
 
 @app.route("/reports/<report_id>/evidence/opened", methods=["POST"])
