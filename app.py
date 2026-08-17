@@ -340,7 +340,7 @@ REPORT_ACTIONS = {
 # Statuses an investigation can start from.
 _PRE_INVESTIGATION = ("open", "pending")
 
-REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reported", "reason"]
+REQUIRED_CREATE_FIELDS = ["report_id", "reporter", "reported", "reason", "notes", "evidence"]
 
 # Fields that BotGhost/clients are allowed to directly overwrite via PATCH.
 # notes/evidence/timeline stay append-only via their dedicated endpoints,
@@ -826,8 +826,8 @@ def create_report():
             "reporter": payload["reporter"],
             "reported": payload["reported"],
             "reason": payload["reason"],
-            "notes": "",
-            "evidence": "",
+            "notes": str(payload["notes"]).strip(),
+            "evidence": str(payload["evidence"]).strip(),
             "status": status,
             "assigned_agent": assigned_agent,
             "created_at": now,
@@ -845,6 +845,20 @@ def create_report():
             "by": payload.get("reporter", "Unknown"),
             "created_at": now,
         }).execute()
+
+        # Hard-store the reporter's evidence in public.evidence as well.
+        reporter = payload.get("reporter", "Unknown")
+        evidence_text = str(payload["evidence"]).strip()
+        evidence_url = str(payload.get("evidence_url", "")).strip()
+
+        if evidence_text:
+            supabase.table(EVIDENCE_TABLE).insert({
+                "report_id": report_id,
+                "description": evidence_text,
+                "url": evidence_url,
+                "submitted_by": reporter,
+                "created_at": now,
+            }).execute()
 
         report = fetch_full_report_or_raise(report_id)
 
