@@ -524,21 +524,6 @@ def fetch_agent_or_raise(discord_id):
     return serialize_agent(row)
 
 
-def _summarize_notes_column(notes_rows):
-    """Builds the flat, human-readable reports.notes TEXT column."""
-    return " | ".join(
-        f"[{r.get('author', 'Unknown')}] {r.get('note', '')}" for r in notes_rows
-    )
-
-
-def _summarize_evidence_column(evidence_rows):
-    """Builds the flat, human-readable reports.evidence TEXT column."""
-    return " | ".join(
-        f"[{r.get('submitted_by', 'Unknown')}] {r.get('description', '')}"
-        for r in evidence_rows
-    )
-
-
 # =====================
 # HOME
 # =====================
@@ -1325,11 +1310,7 @@ def add_note(report_id):
             "created_at": now,
         }).execute()
 
-        notes_rows = db_get_notes(report_id)
-        supabase.table(REPORTS_TABLE).update({
-            "notes": _summarize_notes_column(notes_rows),
-            "updated_at": now,
-        }).eq("report_id", report_id).execute()
+        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
 
         entry = {"note": note_text, "author": author, "timestamp": now}
         report = fetch_full_report_or_raise(report_id)
@@ -1403,11 +1384,7 @@ def add_evidence(report_id):
             "created_at": now,
         }).execute()
 
-        evidence_rows = db_get_evidence(report_id)
-        supabase.table(REPORTS_TABLE).update({
-            "evidence": _summarize_evidence_column(evidence_rows),
-            "updated_at": now,
-        }).eq("report_id", report_id).execute()
+        supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
 
         entry = {
             "description": description,
