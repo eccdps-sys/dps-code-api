@@ -1893,9 +1893,10 @@ def next_supervisor_action():
 @app.route("/actions/pending/operator", methods=["GET"])
 def list_operator_actions():
     """List all pending operator (non-supervisor) actions. Dashboard + bot-facing."""
-    denied = authorize_dashboard("view_dashboard")
-    if denied and not verify_api_key():
-        return error_response("Unauthorized", 401)
+    if not verify_api_key():
+        denied = authorize_dashboard("view_dashboard")
+        if denied:
+            return denied
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
@@ -1917,9 +1918,14 @@ def list_operator_actions():
 @app.route("/actions/pending/supervisor", methods=["GET"])
 def list_supervisor_actions():
     """List all pending supervisor actions. Dashboard + bot-facing."""
-    denied = authorize_dashboard("view_dashboard")
-    if denied and not verify_api_key():
-        return error_response("Unauthorized", 401)
+    if not verify_api_key():
+        denied = authorize_dashboard("view_dashboard")
+        if denied:
+            return denied
+        # Supervisor queue is restricted to Senior Agent rank and above
+        agent = active_agent_from_session()
+        if not has_supervisor_access(agent or {}):
+            return error_response("Supervisor queue requires Senior Agent rank or above", 403)
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
