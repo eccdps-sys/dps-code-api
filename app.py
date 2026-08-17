@@ -1693,7 +1693,7 @@ def list_pending_actions():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(50)
@@ -1733,7 +1733,7 @@ def next_pending_action():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(1)
@@ -1843,7 +1843,7 @@ def _next_action_for_queue(is_supervisor: bool):
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(50)
@@ -1907,7 +1907,7 @@ def list_operator_actions():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(50)
@@ -1936,7 +1936,7 @@ def list_supervisor_actions():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(50)
