@@ -498,6 +498,8 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
         "reporter": report_row.get("reporter"),
         "reported": report_row.get("reported"),
         "reason": report_row.get("reason"),
+        "reporter_notes": report_row.get("notes"),
+        "reporter_evidence": report_row.get("evidence"),
         "status": report_row.get("status"),
         "assigned_agent": report_row.get("assigned_agent"),
         "notes": [serialize_note(r) for r in notes_rows],
