@@ -480,6 +480,67 @@ def serialize_agent(row):
     }
 
 
+def build_report_list_item(report_row, agent_name_map=None):
+    """
+    Lightweight serializer for list endpoints. Does NOT fetch notes/evidence/
+    timeline — those are expensive and unused in list views. Agent name
+    resolution uses a pre-built map to avoid per-row DB calls.
+    """
+    assigned_agent = report_row.get("assigned_agent")
+    assigned_agent_name = assigned_agent
+    if assigned_agent and str(assigned_agent).strip().isdigit():
+        assigned_agent_name = (
+            (agent_name_map or {}).get(str(assigned_agent).strip())
+            or assigned_agent
+        )
+    return {
+        "report_id": report_row["report_id"],
+        "reporter": report_row.get("reporter"),
+        "reported": report_row.get("reported"),
+        "reason": report_row.get("reason"),
+        "reporter_notes": report_row.get("notes"),
+        "reporter_evidence": report_row.get("evidence"),
+        "status": report_row.get("status"),
+        "assigned_agent": assigned_agent,
+        "assigned_agent_name": assigned_agent_name,
+        "notes": [],
+        "evidence": [],
+        "timeline": [],
+        "created_at": report_row.get("created_at"),
+        "updated_at": report_row.get("updated_at"),
+        "is_supervisor": report_row.get("is_supervisor"),
+        "thread_id": report_row.get("thread_id"),
+    }
+
+
+def build_agent_name_map(rows):
+    """
+    Given a list of report rows, returns a dict of {discord_id: display_name}
+    for all rows where assigned_agent looks like a Discord ID. Fetches all
+    matching agents in a single query.
+    """
+    ids = {
+        str(r.get("assigned_agent")).strip()
+        for r in rows
+        if r.get("assigned_agent") and str(r.get("assigned_agent")).strip().isdigit()
+    }
+    if not ids:
+        return {}
+    try:
+        resp = (
+            supabase.table(AGENTS_TABLE)
+            .select("discord_id, name, agent_id")
+            .in_("discord_id", list(ids))
+            .execute()
+        )
+        return {
+            row["discord_id"]: (row.get("name") or row.get("agent_id") or row["discord_id"])
+            for row in (resp.data or [])
+        }
+    except Exception:
+        return {}
+
+
 def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_rows=None):
     """
     Assembles the full report object in exactly the shape BotGhost/the old
@@ -1140,11 +1201,13 @@ def list_reports():
             query = query.ilike("status", status_filter)
         resp = query.execute()
         rows = resp.data or []
+
+        # Resolve all Discord IDs to names in a single batch query
+        agent_name_map = build_agent_name_map(rows)
+
         reports = []
         for row in rows:
             if row.get("is_supervisor") and not can_supervisor:
-                # Return a minimal stub so the dashboard can render a locked row.
-                # No sensitive fields are included — only enough to show the lock UI.
                 reports.append({
                     "report_id": row["report_id"],
                     "is_supervisor": True,
@@ -1152,8 +1215,11 @@ def list_reports():
                     "reporter": None,
                     "reported": None,
                     "reason": None,
+                    "reporter_notes": None,
+                    "reporter_evidence": None,
                     "status": None,
                     "assigned_agent": None,
+                    "assigned_agent_name": None,
                     "notes": [],
                     "evidence": [],
                     "timeline": [],
@@ -1162,7 +1228,7 @@ def list_reports():
                     "thread_id": None,
                 })
             else:
-                reports.append(build_report_json(row))
+                reports.append(build_report_list_item(row, agent_name_map))
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
