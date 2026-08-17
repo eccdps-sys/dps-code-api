@@ -1782,7 +1782,7 @@ def list_pending_actions():
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
             .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
-            .eq("status", "pending")
+            .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
             .execute()
@@ -1800,6 +1800,7 @@ def list_pending_actions():
             "action": r.get("action"),
             "requested_by": r.get("requested_by"),
             "created_at": r.get("created_at"),
+            "status": r.get("status"),
             "report": r.get("reports"),
         }
         for r in rows
@@ -1932,7 +1933,7 @@ def _next_action_for_queue(is_supervisor: bool):
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
             .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
-            .eq("status", "pending")
+            .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
             .execute()
@@ -1996,7 +1997,7 @@ def list_operator_actions():
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
             .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
-            .eq("status", "pending")
+            .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
             .execute()
@@ -2006,7 +2007,7 @@ def list_operator_actions():
         return error_response(f"Unexpected server error: {str(e)}", 500)
     actions = [{"id": r["id"], "report_id": r.get("report_id"), "action": r.get("action"),
                 "requested_by": r.get("requested_by"), "created_at": r.get("created_at"),
-                "report": r.get("reports")} for r in rows]
+                "status": r.get("status"), "report": r.get("reports")} for r in rows]
     return jsonify({"success": True, "count": len(actions), "actions": actions}), 200
 
 
@@ -2025,7 +2026,7 @@ def list_supervisor_actions():
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
             .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
-            .eq("status", "pending")
+            .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
             .execute()
@@ -2035,7 +2036,7 @@ def list_supervisor_actions():
         return error_response(f"Unexpected server error: {str(e)}", 500)
     actions = [{"id": r["id"], "report_id": r.get("report_id"), "action": r.get("action"),
                 "requested_by": r.get("requested_by"), "created_at": r.get("created_at"),
-                "report": r.get("reports")} for r in rows]
+                "status": r.get("status"), "report": r.get("reports")} for r in rows]
     return jsonify({"success": True, "count": len(actions), "actions": actions}), 200
 
 
