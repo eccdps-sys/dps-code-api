@@ -493,6 +493,19 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
     if timeline_rows is None:
         timeline_rows = db_get_timeline(report_row["report_id"])
 
+    # Resolve assigned_agent to a display name if it looks like a Discord ID
+    # (all digits). Falls back to the raw value if the lookup fails.
+    assigned_agent = report_row.get("assigned_agent")
+    assigned_agent_name = assigned_agent
+    if assigned_agent and str(assigned_agent).strip().isdigit():
+        agent_row = db_get_agent_row(str(assigned_agent).strip())
+        if agent_row:
+            assigned_agent_name = (
+                agent_row.get("name")
+                or agent_row.get("agent_id")
+                or assigned_agent
+            )
+
     return {
         "report_id": report_row["report_id"],
         "reporter": report_row.get("reporter"),
@@ -501,7 +514,8 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
         "reporter_notes": report_row.get("notes"),
         "reporter_evidence": report_row.get("evidence"),
         "status": report_row.get("status"),
-        "assigned_agent": report_row.get("assigned_agent"),
+        "assigned_agent": assigned_agent,
+        "assigned_agent_name": assigned_agent_name,
         "notes": [serialize_note(r) for r in notes_rows],
         "evidence": [serialize_evidence(r) for r in evidence_rows],
         "timeline": [serialize_timeline(r) for r in timeline_rows],
