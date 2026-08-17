@@ -4,7 +4,6 @@ import string
 import os
 import json
 import secrets
-import threading
 from datetime import datetime, timezone, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -38,12 +37,6 @@ DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
 DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "").rstrip("/")
 
-# Webhook URL for the forum channel where report threads live.
-# Set DISCORD_AUDIT_WEBHOOK on Render to enable audit trail messages.
-DISCORD_AUDIT_WEBHOOK = os.environ.get("DISCORD_AUDIT_WEBHOOK", "").strip()
-# Separate webhook for the supervisor-only forum channel.
-DISCORD_AUDIT_WEBHOOK_SUPERVISOR = os.environ.get("DISCORD_AUDIT_WEBHOOK_SUPERVISOR", "").strip()
-
 # Ranks that are permitted to view and action supervisor reports.
 # Anything below Senior Agent is blocked at the API level.
 SUPERVISOR_RANKS = {
@@ -61,87 +54,6 @@ REASSIGN_RANKS = {
     "Director",
     "Department Director",
 }
-
-# =====================================================================
-# DISCORD AUDIT TRAIL
-# Posts a lightweight embed into the report's forum thread whenever a
-# dashboard agent takes an action. Runs in a background thread so it
-# never slows down the API response. Silently no-ops if the webhook URL
-# is not configured or the report has no thread_id stored.
-# =====================================================================
-
-# Emoji prefix per action type — keeps messages scannable at a glance.
-_AUDIT_ICONS = {
-    "viewed":        "👁️",
-    "created":       "📋",
-    "note":          "📝",
-    "evidence":      "📎",
-    "status":        "🔄",
-    "reassign":      "👤",
-    "field":         "✏️",
-    "deleted":       "🗑️",
-    "timeline":      "📌",
-    "investigation": "🔍",
-    "validate":      "✅",
-    "invalidate":    "❌",
-    "contact":       "📨",
-    "bot":           "🤖",
-}
-
-def _post_webhook(url: str, payload: dict):
-    """Fire-and-forget POST to a Discord webhook URL."""
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "ECCDPSDashboard/1.0 (+https://api.eccdps.org)",
-            },
-            method="POST",
-        )
-        with urlopen(req, timeout=10):
-            pass
-    except Exception as exc:
-        app.logger.warning("Discord audit webhook failed: %s", exc)
-
-
-def send_to_thread(thread_id: str | None, action: str, by: str, detail: str = "", is_supervisor: bool = False):
-    """
-    Post an audit message into the report's Discord forum thread.
-
-    thread_id     – Discord thread/channel ID stored on the report row.
-                    If None or empty, this is a no-op.
-    action        – key from _AUDIT_ICONS (e.g. "status", "note").
-    by            – display name of the agent who performed the action.
-    detail        – optional one-line description appended after the action label.
-    is_supervisor – selects the supervisor webhook when True.
-    """
-    webhook = DISCORD_AUDIT_WEBHOOK_SUPERVISOR if is_supervisor else DISCORD_AUDIT_WEBHOOK
-    if not webhook or not thread_id:
-        return
-
-    icon  = _AUDIT_ICONS.get(action, "🔔")
-    label = action.replace("_", " ").title()
-    description = f"{icon} **{label}**"
-    if detail:
-        description += f" — {detail}"
-    description += f"\nBy **{by}**"
-
-    payload = {
-        "embeds": [{
-            "description": description,
-            "color": 0xE67E22 if is_supervisor else 0x5865F2,
-            "footer": {
-                "text": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
-            },
-        }]
-    }
-
-    url = f"{webhook}?thread_id={thread_id}&wait=false"
-    t = threading.Thread(target=_post_webhook, args=(url, payload), daemon=True)
-    t.start()
 
 # Change these values to adjust dashboard access later. Every protected API
 # route checks this map, so hiding a button in the UI is never the only guard.
@@ -497,7 +409,9 @@ def build_report_list_item(report_row, agent_name_map=None):
     return {
         "report_id": report_row["report_id"],
         "reporter": report_row.get("reporter"),
+        "reporter_name": report_row.get("reporter_name"),
         "reported": report_row.get("reported"),
+        "reported_name": report_row.get("reported_name"),
         "reason": report_row.get("reason"),
         "reporter_notes": report_row.get("notes"),
         "reporter_evidence": report_row.get("evidence"),
@@ -571,7 +485,9 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
     return {
         "report_id": report_row["report_id"],
         "reporter": report_row.get("reporter"),
+        "reporter_name": report_row.get("reporter_name"),
         "reported": report_row.get("reported"),
+        "reported_name": report_row.get("reported_name"),
         "reason": report_row.get("reason"),
         "reporter_notes": report_row.get("notes"),
         "reporter_evidence": report_row.get("evidence"),
@@ -902,7 +818,9 @@ def create_report():
         insert_row = {
             "report_id": report_id,
             "reporter": payload["reporter"],
+            "reporter_name": str(payload.get("reporter_name", "")).strip() or None,
             "reported": payload["reported"],
+            "reported_name": str(payload.get("reported_name", "")).strip() or None,
             "reason": payload["reason"],
             "notes": str(payload["notes"]).strip(),
             "evidence": str(payload["evidence"]).strip(),
@@ -944,11 +862,6 @@ def create_report():
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
-
-    thread_id = insert_row.get("thread_id")
-    actor = payload.get("reporter", "Unknown")
-    send_to_thread(thread_id, "created", actor,
-                   f"`{report_id}` opened · reported: {payload['reported']}")
 
     return jsonify({"success": True, "report": report}), 201
 
@@ -1021,10 +934,6 @@ def report_viewed(report_id):
     except Exception as exc:
         app.logger.warning("Could not write viewed timeline entry: %s", exc)
 
-    send_to_thread(row.get("thread_id"), "viewed", by,
-                   f"`{report_id}` opened in dashboard",
-                   is_supervisor=bool(row.get("is_supervisor")))
-
     return jsonify({"success": True}), 200
 
 
@@ -1082,10 +991,6 @@ def evidence_opened(report_id):
     except Exception as exc:
         app.logger.warning("Could not write evidence_opened timeline entry: %s", exc)
 
-    send_to_thread(row.get("thread_id"), "viewed", by,
-                   f"`{report_id}` evidence opened — {description[:60]}{'…' if len(description) > 60 else ''}",
-                   is_supervisor=bool(row.get("is_supervisor")))
-
     return jsonify({"success": True}), 200
 
 
@@ -1140,10 +1045,6 @@ def begin_investigation(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
-    send_to_thread(report.get("thread_id"), "investigation", by,
-                   f"`{report_id}` — investigation begun",
-                   is_supervisor=bool(report.get("is_supervisor")))
-
     return jsonify({"success": True, "report": report}), 200
 
 
@@ -1195,10 +1096,6 @@ def end_investigation(report_id):
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
-
-    send_to_thread(report.get("thread_id"), "investigation", by,
-                   f"`{report_id}` — investigation concluded, status → Pending",
-                   is_supervisor=bool(report.get("is_supervisor")))
 
     return jsonify({"success": True, "report": report}), 200
 
@@ -1356,23 +1253,6 @@ def update_report(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
-    thread_id = report.get("thread_id")
-    is_sup = bool(report.get("is_supervisor"))
-    actor = request.get_json(silent=True) or {}
-    agent_session = active_agent_from_session()
-    by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
-    if "assigned_agent" in (request.get_json(silent=True) or {}):
-        send_to_thread(thread_id, "reassign", by,
-                       f"`{report_id}` → {report.get('assigned_agent', 'Unassigned')}",
-                       is_supervisor=is_sup)
-    elif "status" in (request.get_json(silent=True) or {}):
-        send_to_thread(thread_id, "status", by,
-                       f"`{report_id}` → {report.get('status')}",
-                       is_supervisor=is_sup)
-    else:
-        send_to_thread(thread_id, "field", by, f"`{report_id}` fields updated",
-                       is_supervisor=is_sup)
-
     return jsonify({"success": True, "report": report}), 200
 
 
@@ -1439,10 +1319,6 @@ def add_note(report_id):
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
-
-    send_to_thread(report.get("thread_id"), "note", author,
-                   f"`{report_id}` — {note_text[:80]}{'…' if len(note_text) > 80 else ''}",
-                   is_supervisor=bool(report.get("is_supervisor")))
 
     return jsonify({"success": True, "note": entry, "report": report}), 201
 
@@ -1519,10 +1395,6 @@ def add_evidence(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
-    send_to_thread(report.get("thread_id"), "evidence", submitted_by,
-                   f"`{report_id}` — {description[:80]}{'…' if len(description) > 80 else ''}",
-                   is_supervisor=bool(report.get("is_supervisor")))
-
     return jsonify({"success": True, "evidence": entry, "report": report}), 201
 
 
@@ -1574,10 +1446,6 @@ def add_timeline_event(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
-    send_to_thread(report.get("thread_id"), "timeline", by,
-                   f"`{report_id}` — {event_text[:80]}{'…' if len(event_text) > 80 else ''}",
-                   is_supervisor=bool(report.get("is_supervisor")))
-
     return jsonify({"success": True, "event": entry, "report": report}), 201
 
 
@@ -1600,19 +1468,12 @@ def delete_report(report_id):
         if denied:
             return denied
 
-        thread_id = existing.get("thread_id")
-        is_sup = bool(existing.get("is_supervisor"))
         supabase.table(REPORTS_TABLE).delete().eq("report_id", report_id).execute()
 
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
-
-    agent_session = active_agent_from_session()
-    by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
-    send_to_thread(thread_id, "deleted", by, f"`{report_id}` permanently deleted",
-                   is_supervisor=is_sup)
 
     return jsonify({"success": True, "deleted": report_id}), 200
 
@@ -1756,11 +1617,6 @@ def report_action(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
-    send_to_thread(report.get("thread_id"), action, by,
-                   f"`{report_id}` — {action.replace('_', ' ')} requested"
-                   + (f": {reason}" if reason else "; bot will follow up"),
-                   is_supervisor=bool(report.get("is_supervisor")))
-
     return jsonify({
         "success": True,
         "action": action,
@@ -1781,7 +1637,7 @@ def list_pending_actions():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reporter_name, reported, reported_name, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
@@ -1822,7 +1678,7 @@ def next_pending_action():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reporter_name, reported, reported_name, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(1)
@@ -1896,17 +1752,11 @@ def complete_action(action_id):
             "completed_at": now,
         }).eq("id", action_id).execute()
 
-        # Audit the bot's completion into the thread so both surfaces see it.
+        # Audit the bot's completion into the timeline.
         report_row = db_get_report_row(row.get("report_id"))
         if report_row:
             summary = note or f"{row.get('action')} finished ({result})"
-            send_to_thread(
-                report_row.get("thread_id"),
-                "bot",
-                "DPS Bot",
-                f"`{row['report_id']}` — {summary}",
-                is_supervisor=bool(report_row.get("is_supervisor")),
-            )
+            app.logger.info("Action %s completed: %s", action_id, summary)
 
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
@@ -1932,7 +1782,7 @@ def _next_action_for_queue(is_supervisor: bool):
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reporter_name, reported, reported_name, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
@@ -1996,7 +1846,7 @@ def list_operator_actions():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reporter_name, reported, reported_name, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
@@ -2025,7 +1875,7 @@ def list_supervisor_actions():
     try:
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
-            .select("*, reports(report_id, reporter, reported, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
+            .select("*, reports(report_id, reporter, reporter_name, reported, reported_name, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
             .in_("status", ["pending", "processing"])
             .order("created_at", desc=False)
             .limit(50)
@@ -2188,10 +2038,6 @@ def contact_reply(report_id):
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
 
-    send_to_thread(row.get("thread_id"), "contact", by,
-                   f"`{report_id}` — agent replied to reporter ({len(messages)}/{CONTACT_MAX_MESSAGES} messages)",
-                   is_supervisor=bool(row.get("is_supervisor")))
-
     return jsonify({
         "success": True,
         "message_count": len(messages),
@@ -2256,10 +2102,6 @@ def contact_respond(report_id):
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
         return error_response(f"Unexpected server error: {str(e)}", 500)
-
-    send_to_thread(row.get("thread_id"), "contact", sender_name,
-                   f"`{report_id}` — reporter replied ({len(messages)}/{CONTACT_MAX_MESSAGES} messages)",
-                   is_supervisor=bool(row.get("is_supervisor")))
 
     return jsonify({
         "success": True,
