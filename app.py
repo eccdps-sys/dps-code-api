@@ -1195,16 +1195,15 @@ def update_report(report_id):
             if agent_session_upd and not is_assigned_agent(agent_session_upd, existing):
                 return error_response("Only the assigned agent can update this case", 403)
 
-        # Status gate: before investigation begins only Open/Pending are allowed
+        # Status gate: before investigation begins only Open/Pending/Appealed are allowed
         if not verify_api_key() and "status" in payload:
             current_status = str(existing.get("status") or "").strip().lower()
             new_status = str(payload["status"]).strip()
             pre_investigation = current_status not in ("under investigation",)
-            # Also block if investigation was concluded (status = pending/closed/appealed after end)
-            allowed_pre = {"Open", "Pending"}
+            allowed_pre = {"Open", "Pending", "Appealed"}
             if pre_investigation and new_status not in allowed_pre:
                 return error_response(
-                    f"Status can only be set to Open or Pending before an investigation has begun. "
+                    f"Status can only be set to Open, Pending, or Appealed before an investigation has begun. "
                     f"Start the investigation first to unlock other statuses.",
                     409,
                 )
