@@ -709,8 +709,10 @@ def discord_callback():
     discord_id = str(user.get("id", "")).strip()
     agent = db_get_agent_row(discord_id) if discord_id else None
     if not agent:
+        app.logger.warning("OAuth login rejected: discord_id %s not found in agents table", discord_id)
         return oauth_failure("not_a_dps_agent")
     if str(agent.get("status") or "").strip().lower() != "active":
+        app.logger.warning("OAuth login rejected: discord_id %s has status %r", discord_id, agent.get("status"))
         return oauth_failure("agent_not_active")
 
     popup = session.pop("oauth_popup", False)
