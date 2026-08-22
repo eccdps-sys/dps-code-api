@@ -443,6 +443,7 @@ def serialize_agent(row):
 
 
 def build_report_list_item(report_row, agent_name_map=None):
+def build_report_list_item(report_row, agent_name_map=None, contact_started_ids=None):
     """
     Lightweight serializer for list endpoints. Does NOT fetch notes/evidence/
     timeline — those are expensive and unused in list views. Agent name
@@ -455,8 +456,11 @@ def build_report_list_item(report_row, agent_name_map=None):
             (agent_name_map or {}).get(str(assigned_agent).strip())
             or assigned_agent
         )
+    report_id = report_row["report_id"]
+    has_contact = report_id in (contact_started_ids or set())
+    contact_open = has_contact and not bool(report_row.get("contact_closed"))
     return {
-        "report_id": report_row["report_id"],
+        "report_id": report_id,
         "reporter": report_row.get("reporter"),
         "reporter_name": report_row.get("reporter_name"),
         "reported": report_row.get("reported"),
@@ -477,6 +481,7 @@ def build_report_list_item(report_row, agent_name_map=None):
         "contact_closed": bool(report_row.get("contact_closed")),
         "contact_closed_at": report_row.get("contact_closed_at"),
         "contact_closed_by": report_row.get("contact_closed_by"),
+        "contact_open": contact_open,
     }
 
 
@@ -1191,6 +1196,21 @@ def list_reports():
         # Resolve all Discord IDs to names in a single batch query
         agent_name_map = build_agent_name_map(rows)
 
+        # Batch-fetch which reports have at least one contact message (for contact_open tag)
+        report_ids = [r["report_id"] for r in rows]
+        contact_started_ids: set = set()
+        if report_ids:
+            try:
+                cm_resp = (
+                    supabase.table(CONTACT_MESSAGES_TABLE)
+                    .select("report_id")
+                    .in_("report_id", report_ids)
+                    .execute()
+                )
+                contact_started_ids = {cm["report_id"] for cm in (cm_resp.data or [])}
+            except Exception:
+                pass  # non-fatal — tag just won't show
+
         reports = []
         for row in rows:
             if row.get("is_supervisor") and not can_supervisor:
@@ -1214,7 +1234,7 @@ def list_reports():
                     "thread_id": None,
                 })
             else:
-                reports.append(build_report_list_item(row, agent_name_map))
+                reports.append(build_report_list_item(row, agent_name_map, contact_started_ids))
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
