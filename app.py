@@ -1182,7 +1182,7 @@ def audit_log():
       ?offset=N      — pagination offset
     Requires dashboard login or API key.
     """
-    denied = authorize_dashboard("view_dashboard")
+    denied = authorize_dashboard("decide_appeal")
     if denied:
         return denied
 
@@ -1196,10 +1196,10 @@ def audit_log():
         limit, offset = 200, 0
 
     try:
-        # Fetch timeline rows joined with report to get is_supervisor flag
+        # Fetch timeline rows directly (no join — no FK relationship in schema cache)
         query = (
             supabase.table(TIMELINE_TABLE)
-            .select("*, reports(report_id, is_supervisor, reporter, reporter_name, reported, reported_name, reason)")
+            .select("id, report_id, event, by, created_at")
             .order("created_at", desc=True)
             .limit(500)
         )
@@ -1207,6 +1207,19 @@ def audit_log():
             query = query.eq("report_id", report_filter)
         resp = query.execute()
         rows = resp.data or []
+
+        # Batch-fetch report metadata for all report IDs in one query
+        report_ids = list({r["report_id"] for r in rows if r.get("report_id")})
+        report_map: dict = {}
+        if report_ids:
+            rresp = (
+                supabase.table(REPORTS_TABLE)
+                .select("report_id, is_supervisor, reporter, reporter_name, reported, reported_name, reason")
+                .in_("report_id", report_ids)
+                .execute()
+            )
+            for rr in (rresp.data or []):
+                report_map[rr["report_id"]] = rr
     except APIError as e:
         return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
     except Exception as e:
@@ -1214,30 +1227,28 @@ def audit_log():
 
     events = []
     for row in rows:
-        report = row.get("reports") or {}
+        report = report_map.get(row.get("report_id") or "", {})
         if report.get("is_supervisor") and not can_supervisor:
             continue
         event_text = str(row.get("event") or "")
         by_text    = str(row.get("by") or "")
         rid        = str(row.get("report_id") or "")
-        # Search filter — match on event, by, or report_id
         if search and not any(
             search in v.lower() for v in [event_text, by_text, rid]
         ):
             continue
-        # Split event title / detail on the \n separator
         parts = event_text.split("\n", 1)
         events.append({
-            "id":          row.get("id"),
-            "report_id":   rid,
-            "event":       parts[0].strip(),
-            "detail":      parts[1].strip() if len(parts) > 1 else None,
-            "by":          by_text or None,
-            "timestamp":   row.get("created_at"),
+            "id":            row.get("id"),
+            "report_id":     rid,
+            "event":         parts[0].strip(),
+            "detail":        parts[1].strip() if len(parts) > 1 else None,
+            "by":            by_text or None,
+            "timestamp":     row.get("created_at"),
             "is_supervisor": bool(report.get("is_supervisor")),
             "reported_name": report.get("reported_name") or report.get("reported"),
             "reporter_name": report.get("reporter_name") or report.get("reporter"),
-            "subject":     (report.get("reason") or "").strip() or None,
+            "subject":       (report.get("reason") or "").strip() or None,
         })
 
     total = len(events)
