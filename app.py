@@ -36,6 +36,9 @@ API_KEY = os.environ.get("API_KEY")
 DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI")
+# Cloudflare Worker that proxies the Discord token exchange off Render's shared IP
+DISCORD_OAUTH_PROXY_URL = os.environ.get("DISCORD_OAUTH_PROXY_URL")
+DISCORD_OAUTH_PROXY_SECRET = os.environ.get("DISCORD_OAUTH_PROXY_SECRET")
 DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "").rstrip("/")
 
 # Ranks that are permitted to view and action supervisor reports.
@@ -88,6 +91,51 @@ def oauth_configured():
         DISCORD_REDIRECT_URI,
         DASHBOARD_ORIGIN,
     ])
+
+
+def _discord_token_exchange(code: str, redirect_uri: str) -> dict:
+    """
+    Exchange an authorization code for a Discord access token.
+    Routes through the Cloudflare Worker proxy when configured so the
+    outbound request doesn't come from Render's shared IP.
+    Falls back to calling Discord directly if the proxy is not configured.
+    """
+    if DISCORD_OAUTH_PROXY_URL and DISCORD_OAUTH_PROXY_SECRET:
+        # Use the Worker proxy
+        payload = json.dumps({"code": code, "redirect_uri": redirect_uri}).encode("utf-8")
+        req = Request(
+            DISCORD_OAUTH_PROXY_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Worker-Secret": DISCORD_OAUTH_PROXY_SECRET,
+                "User-Agent": "ECCDPSDashboard/1.0 (+https://api.eccdps.org)",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = {"raw": body}
+            raise DiscordAPIError(e.code, parsed) from e
+    else:
+        # Direct fallback (no proxy configured)
+        return discord_json_request(
+            "https://discord.com/api/oauth2/token",
+            method="POST",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
 
 
 def active_agent_from_session():
@@ -640,25 +688,13 @@ def discord_callback():
     if not secrets.compare_digest(state, expected_state):
         return oauth_failure("oauth_state_mismatch")
 
-    # Token exchange with retry-backoff for transient 429s from Discord/Cloudflare.
-    _token_exchange_data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-    }
     access_token = None
-    _retry_delays = [2, 5, 15]  # seconds between attempts (3 attempts total)
+    _retry_delays = [2, 5, 15]
     for _attempt, _delay in enumerate([0] + _retry_delays):
         if _delay:
             time.sleep(_delay)
         try:
-            token = discord_json_request(
-                "https://discord.com/api/oauth2/token",
-                method="POST",
-                data=_token_exchange_data,
-            )
+            token = _discord_token_exchange(code, DISCORD_REDIRECT_URI)
             access_token = token.get("access_token")
             if not access_token:
                 raise ValueError("Discord did not return an access token")
@@ -671,7 +707,6 @@ def discord_callback():
                 e.status, _attempt + 1, e.body,
             )
             if is_rate_limit and _attempt < len(_retry_delays):
-                # Honour Discord's retry_after if present, capped at 30s
                 suggested = int((e.body or {}).get("retry_after", 0)) if isinstance(e.body, dict) else 0
                 wait = min(max(suggested, _retry_delays[_attempt]), 30)
                 app.logger.warning("Rate limited by Discord, waiting %ss before retry", wait)
