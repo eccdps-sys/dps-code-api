@@ -442,7 +442,6 @@ def serialize_agent(row):
     }
 
 
-def build_report_list_item(report_row, agent_name_map=None):
 def build_report_list_item(report_row, agent_name_map=None, contact_started_ids=None):
     """
     Lightweight serializer for list endpoints. Does NOT fetch notes/evidence/
