@@ -1171,6 +1171,87 @@ def end_investigation(report_id):
     return jsonify({"success": True, "report": report}), 200
 
 
+@app.route("/audit", methods=["GET"])
+def audit_log():
+    """
+    Global audit log — all timeline events across all reports, newest first.
+    Supports optional query params:
+      ?search=text   — case-insensitive substring match on event text or by field
+      ?report_id=X   — filter to a single report
+      ?limit=N       — max rows (default 200, max 500)
+      ?offset=N      — pagination offset
+    Requires dashboard login or API key.
+    """
+    denied = authorize_dashboard("view_dashboard")
+    if denied:
+        return denied
+
+    can_supervisor = verify_api_key() or has_supervisor_access(active_agent_from_session() or {})
+    search     = (request.args.get("search") or "").strip().lower()
+    report_filter = (request.args.get("report_id") or "").strip()
+    try:
+        limit  = min(int(request.args.get("limit",  200)), 500)
+        offset = max(int(request.args.get("offset", 0)),   0)
+    except (ValueError, TypeError):
+        limit, offset = 200, 0
+
+    try:
+        # Fetch timeline rows joined with report to get is_supervisor flag
+        query = (
+            supabase.table(TIMELINE_TABLE)
+            .select("*, reports(report_id, is_supervisor, reporter, reporter_name, reported, reported_name, reason)")
+            .order("created_at", desc=True)
+            .limit(500)
+        )
+        if report_filter:
+            query = query.eq("report_id", report_filter)
+        resp = query.execute()
+        rows = resp.data or []
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    events = []
+    for row in rows:
+        report = row.get("reports") or {}
+        if report.get("is_supervisor") and not can_supervisor:
+            continue
+        event_text = str(row.get("event") or "")
+        by_text    = str(row.get("by") or "")
+        rid        = str(row.get("report_id") or "")
+        # Search filter — match on event, by, or report_id
+        if search and not any(
+            search in v.lower() for v in [event_text, by_text, rid]
+        ):
+            continue
+        # Split event title / detail on the \n separator
+        parts = event_text.split("\n", 1)
+        events.append({
+            "id":          row.get("id"),
+            "report_id":   rid,
+            "event":       parts[0].strip(),
+            "detail":      parts[1].strip() if len(parts) > 1 else None,
+            "by":          by_text or None,
+            "timestamp":   row.get("created_at"),
+            "is_supervisor": bool(report.get("is_supervisor")),
+            "reported_name": report.get("reported_name") or report.get("reported"),
+            "reporter_name": report.get("reporter_name") or report.get("reporter"),
+            "subject":     (report.get("reason") or "").strip() or None,
+        })
+
+    total = len(events)
+    page  = events[offset : offset + limit]
+
+    return jsonify({
+        "success": True,
+        "total":   total,
+        "offset":  offset,
+        "limit":   limit,
+        "events":  page,
+    }), 200
+
+
 @app.route("/reports", methods=["GET"])
 def list_reports():
     """
