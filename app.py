@@ -868,7 +868,18 @@ def create_report():
     if denied:
         return denied
 
-    payload = request.get_json(silent=True)
+    # BotGhost embeds literal newlines into JSON string values when a user
+    # presses Enter in a multi-line field. Bare control chars are invalid in
+    # JSON strings (RFC 8259 §7), so sanitise the raw body before parsing.
+    import re as _re, json as _json
+    _raw = request.get_data(as_text=True)
+    _sanitised = _re.sub(r'\r\n', r'\\n', _raw)
+    _sanitised = _re.sub(r'\r', r'\\n', _sanitised)
+    _sanitised = _re.sub(r'(?<!\\)\n', r'\\n', _sanitised)
+    try:
+        payload = _json.loads(_sanitised)
+    except Exception:
+        payload = None
     if payload is None:
         return error_response("Request body must be valid JSON", 400)
 
