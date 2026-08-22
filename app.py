@@ -232,8 +232,8 @@ AGENTS_TABLE = "agents"
 PENDING_ACTIONS_TABLE = "pending_actions"
 CONTACT_MESSAGES_TABLE = "contact_messages"
 
-# Maximum number of messages allowed in a contact_reporter conversation.
-CONTACT_MAX_MESSAGES = 5
+# Maximum number of messages allowed in a contact_reporter conversation
+# was removed — the agent now controls when the conversation ends.
 
 # Report actions that require the Discord bot to do follow-up work (DM the
 # reporter, adjust roles, post logs). Each one is queued for the bot after
@@ -425,6 +425,9 @@ def build_report_list_item(report_row, agent_name_map=None):
         "updated_at": report_row.get("updated_at"),
         "is_supervisor": report_row.get("is_supervisor"),
         "thread_id": report_row.get("thread_id"),
+        "contact_closed": bool(report_row.get("contact_closed")),
+        "contact_closed_at": report_row.get("contact_closed_at"),
+        "contact_closed_by": report_row.get("contact_closed_by"),
     }
 
 
@@ -501,6 +504,9 @@ def build_report_json(report_row, notes_rows=None, evidence_rows=None, timeline_
         "updated_at": report_row.get("updated_at"),
         "is_supervisor": report_row.get("is_supervisor"),
         "thread_id": report_row.get("thread_id"),
+        "contact_closed": bool(report_row.get("contact_closed")),
+        "contact_closed_at": report_row.get("contact_closed_at"),
+        "contact_closed_by": report_row.get("contact_closed_by"),
     }
 
 
@@ -1581,8 +1587,7 @@ def report_action(report_id):
         }).execute()
 
         # For contact_reporter: write the opening agent message into
-        # contact_messages so the dashboard thread card shows message 1/5
-        # immediately and unlocks the reply box.
+        # contact_messages so the dashboard thread card shows immediately.
         if action == "contact_reporter":
             opening_body = reason or "An agent has reached out regarding your report and will be in contact shortly."
             supabase.table(CONTACT_MESSAGES_TABLE).insert({
@@ -1892,7 +1897,7 @@ def list_supervisor_actions():
 # =====================================================================
 # CONTACT REPORTER CONVERSATION
 # =====================================================================
-# A capped (5-message) back-and-forth between the assigned agent and the
+# Agent-controlled back-and-forth between the assigned agent and the
 # reporter, relayed through the Discord bot via DMs.
 #
 # Flow:
@@ -1901,9 +1906,12 @@ def list_supervisor_actions():
 #      message with sender="agent").
 #   2. Reporter DMs the bot back → bot calls POST /reports/:id/contact/respond
 #      with {"body": "...", "sender_name": "ReporterName"}.
-#   3. Agent replies from the dashboard → POST /reports/:id/contact/reply
+#   3. Agent sends follow-up from dashboard → POST /reports/:id/contact/reply
 #      with {"body": "..."} → queues another bot DM to reporter.
-#   4. Repeat up to CONTACT_MAX_MESSAGES total (combined).
+#   4. Agent ends the conversation → POST /reports/:id/contact/close.
+#      After this, reply and respond are both blocked.
+#
+# There is no message limit. The agent controls when the thread ends.
 #
 # GET /reports/:id/contact returns the full thread so the dashboard can
 # show the conversation card.
@@ -1932,7 +1940,7 @@ def serialize_contact_message(row):
 
 @app.route("/reports/<report_id>/contact", methods=["GET"])
 def get_contact_thread(report_id):
-    """Return the contact_reporter conversation for this report."""
+    """Return the contact conversation and closed state for this report."""
     denied = authorize_dashboard("manage_dockets")
     if denied:
         return denied
@@ -1956,7 +1964,9 @@ def get_contact_thread(report_id):
         "success": True,
         "report_id": report_id,
         "message_count": len(messages),
-        "max_messages": CONTACT_MAX_MESSAGES,
+        "closed": bool(row.get("contact_closed")),
+        "closed_at": row.get("contact_closed_at"),
+        "closed_by": row.get("contact_closed_by"),
         "messages": [serialize_contact_message(m) for m in messages],
     }), 200
 
@@ -1966,7 +1976,7 @@ def contact_reply(report_id):
     """
     Dashboard agent sends a follow-up message to the reporter.
     Inserts a contact_message row (sender='agent') and queues a bot DM.
-    Blocked once the conversation reaches CONTACT_MAX_MESSAGES.
+    Blocked if the conversation has been closed.
     """
     denied = authorize_dashboard("manage_dockets")
     if denied:
@@ -1989,15 +1999,12 @@ def contact_reply(report_id):
         if denied:
             return denied
 
+        if row.get("contact_closed"):
+            return error_response("This conversation has been closed by the agent", 409)
+
         agent_session = active_agent_from_session()
         if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
             return error_response("Only the assigned agent can contact the reporter", 403)
-
-        messages = db_get_contact_messages(report_id)
-        if len(messages) >= CONTACT_MAX_MESSAGES:
-            return error_response(
-                f"This conversation has reached the {CONTACT_MAX_MESSAGES}-message limit", 409
-            )
 
         by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "DPS Agent"
         now = _now_iso()
@@ -2012,7 +2019,7 @@ def contact_reply(report_id):
 
         supabase.table(TIMELINE_TABLE).insert({
             "report_id": report_id,
-            "event": f"Agent message sent to reporter ({len(messages) + 1}/{CONTACT_MAX_MESSAGES})",
+            "event": "Agent message sent to reporter",
             "by": by,
             "created_at": now,
         }).execute()
@@ -2020,12 +2027,82 @@ def contact_reply(report_id):
         supabase.table(REPORTS_TABLE).update({"updated_at": now}).eq("report_id", report_id).execute()
 
         # Queue a bot DM to the reporter.
-        remaining = CONTACT_MAX_MESSAGES - (len(messages) + 1)
         supabase.table(PENDING_ACTIONS_TABLE).insert({
             "report_id": report_id,
             "action": "contact_reporter",
             "requested_by": by,
             "reason": body,
+            "status": "pending",
+            "created_at": now,
+        }).execute()
+
+        messages = db_get_contact_messages(report_id)
+        row = db_get_report_row(report_id)
+
+    except APIError as e:
+        return error_response(f"Database error: {e.message if hasattr(e, 'message') else str(e)}", 500)
+    except Exception as e:
+        return error_response(f"Unexpected server error: {str(e)}", 500)
+
+    return jsonify({
+        "success": True,
+        "message_count": len(messages),
+        "closed": bool((row or {}).get("contact_closed")),
+        "closed_at": (row or {}).get("contact_closed_at"),
+        "closed_by": (row or {}).get("contact_closed_by"),
+        "messages": [serialize_contact_message(m) for m in messages],
+    }), 201
+
+
+@app.route("/reports/<report_id>/contact/close", methods=["POST"])
+def close_contact_thread(report_id):
+    """
+    Agent ends the conversation. No further messages can be sent or received
+    after this. The bot is notified so it can send a closing DM to the reporter.
+    """
+    denied = authorize_dashboard("manage_dockets")
+    if denied:
+        return denied
+
+    try:
+        row = db_get_report_row(report_id)
+        if row is None:
+            return error_response(f"Report '{report_id}' not found", 404)
+
+        denied = supervisor_report_denied(row)
+        if denied:
+            return denied
+
+        if row.get("contact_closed"):
+            return error_response("Conversation is already closed", 409)
+
+        agent_session = active_agent_from_session()
+        if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
+            return error_response("Only the assigned agent can close this conversation", 403)
+
+        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "DPS Agent"
+        now = _now_iso()
+
+        supabase.table(REPORTS_TABLE).update({
+            "contact_closed": True,
+            "contact_closed_at": now,
+            "contact_closed_by": by,
+            "updated_at": now,
+        }).eq("report_id", report_id).execute()
+
+        supabase.table(TIMELINE_TABLE).insert({
+            "report_id": report_id,
+            "event": "Reporter contact conversation closed",
+            "by": by,
+            "created_at": now,
+        }).execute()
+
+        # Notify the bot so it can send a closing DM to the reporter.
+        supabase.table(PENDING_ACTIONS_TABLE).insert({
+            "report_id": report_id,
+            "action": "contact_closed",
+            "requested_by": by,
+            "reason": None,
             "status": "pending",
             "created_at": now,
         }).execute()
@@ -2039,10 +2116,12 @@ def contact_reply(report_id):
 
     return jsonify({
         "success": True,
+        "closed": True,
+        "closed_at": now,
+        "closed_by": by,
         "message_count": len(messages),
-        "max_messages": CONTACT_MAX_MESSAGES,
         "messages": [serialize_contact_message(m) for m in messages],
-    }), 201
+    }), 200
 
 
 @app.route("/reports/<report_id>/contact/respond", methods=["POST"])
@@ -2051,7 +2130,7 @@ def contact_respond(report_id):
     Bot relays the reporter's DM reply back into the conversation.
     Called by BotGhost when the reporter DMs the bot in response.
     Body: {"body": "...", "sender_name": "DiscordUsername"}
-    Bot API key required.
+    Bot API key required. Blocked if the conversation is closed.
     """
     if not verify_api_key():
         return error_response("Unauthorized", 401)
@@ -2070,11 +2149,8 @@ def contact_respond(report_id):
         if row is None:
             return error_response(f"Report '{report_id}' not found", 404)
 
-        messages = db_get_contact_messages(report_id)
-        if len(messages) >= CONTACT_MAX_MESSAGES:
-            return error_response(
-                f"This conversation has reached the {CONTACT_MAX_MESSAGES}-message limit", 409
-            )
+        if row.get("contact_closed"):
+            return error_response("This conversation has been closed", 409)
 
         now = _now_iso()
 
@@ -2088,7 +2164,7 @@ def contact_respond(report_id):
 
         supabase.table(TIMELINE_TABLE).insert({
             "report_id": report_id,
-            "event": f"Reporter replied ({len(messages) + 1}/{CONTACT_MAX_MESSAGES})",
+            "event": "Reporter replied to agent",
             "by": sender_name,
             "created_at": now,
         }).execute()
@@ -2105,7 +2181,6 @@ def contact_respond(report_id):
     return jsonify({
         "success": True,
         "message_count": len(messages),
-        "max_messages": CONTACT_MAX_MESSAGES,
         "messages": [serialize_contact_message(m) for m in messages],
     }), 201
 
