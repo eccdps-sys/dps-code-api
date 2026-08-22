@@ -1615,7 +1615,7 @@ def report_action(report_id):
                     409,
                 )
 
-        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "Dashboard Agent"
+        by = (agent_session or {}).get("discord_id") or (agent_session or {}).get("name") or "Dashboard Agent"
         now = _now_iso()
 
         # Handle claim action: assign the claiming agent to the case
@@ -2067,7 +2067,7 @@ def contact_reply(report_id):
         if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
             return error_response("Only the assigned agent can contact the reporter", 403)
 
-        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "DPS Agent"
+        by = (agent_session or {}).get("discord_id") or (agent_session or {}).get("name") or "DPS Agent"
         now = _now_iso()
 
         supabase.table(CONTACT_MESSAGES_TABLE).insert({
@@ -2141,7 +2141,7 @@ def close_contact_thread(report_id):
         if not verify_api_key() and agent_session and not is_assigned_agent(agent_session, row):
             return error_response("Only the assigned agent can close this conversation", 403)
 
-        by = (agent_session or {}).get("name") or (agent_session or {}).get("agent_id") or "DPS Agent"
+        by = (agent_session or {}).get("discord_id") or (agent_session or {}).get("name") or "DPS Agent"
         now = _now_iso()
 
         supabase.table(REPORTS_TABLE).update({
