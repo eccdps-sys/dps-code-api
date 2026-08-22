@@ -868,15 +868,47 @@ def create_report():
     if denied:
         return denied
 
-    # BotGhost embeds literal newlines into JSON string values when a user
-    # presses Enter in a multi-line field. Bare control chars are invalid in
-    # JSON strings (RFC 8259 §7), so sanitise the raw body before parsing.
-    import re as _re, json as _json
+    # BotGhost substitutes variable values (which may contain literal newlines
+    # from the user pressing Shift+Enter) directly into the JSON body string.
+    # Bare newlines inside a JSON string value are invalid (RFC 8259 §7).
+    # We fix this by scanning the raw body character-by-character and escaping
+    # control characters only while inside a JSON string literal.
+    import json as _json
     _raw = request.get_data(as_text=True)
     app.logger.warning(f"[create_report] raw body repr: {repr(_raw[:500])}")
-    _sanitised = _re.sub(r'\r\n', r'\\n', _raw)
-    _sanitised = _re.sub(r'\r', r'\\n', _sanitised)
-    _sanitised = _re.sub(r'(?<!\\)\n', r'\\n', _sanitised)
+
+    def _sanitise_json_body(s: str) -> str:
+        out = []
+        in_string = False
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if in_string:
+                if c == '\\':
+                    # Already-escaped sequence — pass both chars through unchanged
+                    out.append(c)
+                    i += 1
+                    if i < len(s):
+                        out.append(s[i])
+                elif c == '"':
+                    in_string = False
+                    out.append(c)
+                elif c == '\n':
+                    out.append('\\n')
+                elif c == '\r':
+                    out.append('\\r')
+                elif c == '\t':
+                    out.append('\\t')
+                else:
+                    out.append(c)
+            else:
+                if c == '"':
+                    in_string = True
+                out.append(c)
+            i += 1
+        return ''.join(out)
+
+    _sanitised = _sanitise_json_body(_raw)
     try:
         payload = _json.loads(_sanitised)
     except Exception as _e:
