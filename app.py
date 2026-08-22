@@ -1787,7 +1787,7 @@ def _next_action_for_queue(is_supervisor: bool):
         resp = (
             supabase.table(PENDING_ACTIONS_TABLE)
             .select("*, reports(report_id, reporter, reporter_name, reported, reported_name, reason, notes, evidence, created_at, status, assigned_agent, thread_id, is_supervisor)")
-            .in_("status", ["pending", "processing"])
+            .eq("status", "pending")
             .order("created_at", desc=False)
             .limit(50)
             .execute()
