@@ -873,12 +873,14 @@ def create_report():
     # JSON strings (RFC 8259 §7), so sanitise the raw body before parsing.
     import re as _re, json as _json
     _raw = request.get_data(as_text=True)
+    app.logger.warning(f"[create_report] raw body repr: {repr(_raw[:500])}")
     _sanitised = _re.sub(r'\r\n', r'\\n', _raw)
     _sanitised = _re.sub(r'\r', r'\\n', _sanitised)
     _sanitised = _re.sub(r'(?<!\\)\n', r'\\n', _sanitised)
     try:
         payload = _json.loads(_sanitised)
-    except Exception:
+    except Exception as _e:
+        app.logger.warning(f"[create_report] json parse failed after sanitise: {_e} | sanitised repr: {repr(_sanitised[:500])}")
         payload = None
     if payload is None:
         return error_response("Request body must be valid JSON", 400)
