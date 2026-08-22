@@ -4,6 +4,7 @@ import string
 import os
 import json
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -639,31 +640,54 @@ def discord_callback():
     if not secrets.compare_digest(state, expected_state):
         return oauth_failure("oauth_state_mismatch")
 
-    try:
-        token = discord_json_request(
-            "https://discord.com/api/oauth2/token",
-            method="POST",
-            data={
-                "client_id": DISCORD_CLIENT_ID,
-                "client_secret": DISCORD_CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": DISCORD_REDIRECT_URI,
-            },
-        )
-        access_token = token.get("access_token")
-        if not access_token:
-            raise ValueError("Discord did not return an access token")
-    except DiscordAPIError as e:
-        discord_error = e.body.get("error", "") if isinstance(e.body, dict) else ""
-        app.logger.error("Discord token exchange failed (HTTP %s): %s", e.status, e.body)
-        if discord_error == "redirect_uri_mismatch":
-            return oauth_failure("discord_redirect_uri_mismatch")
-        if discord_error in ("invalid_client", "unauthorized_client"):
-            return oauth_failure("discord_client_misconfigured")
-        return oauth_failure("discord_verification_failed")
-    except (URLError, ValueError, json.JSONDecodeError) as e:
-        app.logger.error("Discord token exchange error: %s", e)
+    # Token exchange with retry-backoff for transient 429s from Discord/Cloudflare.
+    _token_exchange_data = {
+        "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+    }
+    access_token = None
+    _retry_delays = [2, 5, 15]  # seconds between attempts (3 attempts total)
+    for _attempt, _delay in enumerate([0] + _retry_delays):
+        if _delay:
+            time.sleep(_delay)
+        try:
+            token = discord_json_request(
+                "https://discord.com/api/oauth2/token",
+                method="POST",
+                data=_token_exchange_data,
+            )
+            access_token = token.get("access_token")
+            if not access_token:
+                raise ValueError("Discord did not return an access token")
+            break  # success
+        except DiscordAPIError as e:
+            discord_error = e.body.get("error", "") if isinstance(e.body, dict) else ""
+            is_rate_limit = e.status == 429
+            app.logger.error(
+                "Discord token exchange failed (HTTP %s, attempt %s): %s",
+                e.status, _attempt + 1, e.body,
+            )
+            if is_rate_limit and _attempt < len(_retry_delays):
+                # Honour Discord's retry_after if present, capped at 30s
+                suggested = int((e.body or {}).get("retry_after", 0)) if isinstance(e.body, dict) else 0
+                wait = min(max(suggested, _retry_delays[_attempt]), 30)
+                app.logger.warning("Rate limited by Discord, waiting %ss before retry", wait)
+                time.sleep(wait)
+                continue
+            if discord_error == "redirect_uri_mismatch":
+                return oauth_failure("discord_redirect_uri_mismatch")
+            if discord_error in ("invalid_client", "unauthorized_client"):
+                return oauth_failure("discord_client_misconfigured")
+            return oauth_failure("discord_verification_failed")
+        except (URLError, ValueError, json.JSONDecodeError) as e:
+            app.logger.error("Discord token exchange error (attempt %s): %s", _attempt + 1, e)
+            if _attempt < len(_retry_delays):
+                continue
+            return oauth_failure("discord_verification_failed")
+    if not access_token:
         return oauth_failure("discord_verification_failed")
 
     # /users/@me requires the access token; use a separate authenticated call.
