@@ -1805,7 +1805,7 @@ def complete_action(action_id):
             return error_response(f"Action '{action_id}' not found", 404)
         row = rows[0]
 
-        if row.get("status") != "pending":
+        if row.get("status") not in ("pending", "processing"):
             return error_response(
                 f"Action '{action_id}' is already '{row.get('status')}'", 409
             )
